@@ -303,4 +303,125 @@ impl Sim {
     pub fn agent_y(&self, i: u32) -> f32 {
         self.inner.agent_y(i as usize)
     }
+
+    // --- World geography: obstacle mask, endpoint food sources, chemotaxis, and
+    // the reachability / network-cost metric (the "Physarum solves the maze" kit).
+
+    /// Pointer to the obstacle mask within WASM linear memory (`u8` per cell,
+    /// `0` = open, `1` = wall). Pair with [`Sim::obstacle_len`] to build
+    /// `new Uint8Array(memory.buffer, ptr, len)`. Stable for the run (the mask never
+    /// reallocates) — re-fetch only after a reset-class call (`reset`,
+    /// `load_maze_demo`), like the field/food views.
+    pub fn obstacle_ptr(&self) -> *const u8 {
+        self.inner.obstacles().as_ptr()
+    }
+
+    /// Length of the obstacle mask in cells (`width * height`, same as a field).
+    pub fn obstacle_len(&self) -> usize {
+        self.inner.obstacles().len()
+    }
+
+    /// Number of wall cells currently set. `0` means a fully open world (and the
+    /// determinism fast path — every geography branch in the tick is skipped).
+    pub fn obstacle_count(&self) -> u32 {
+        self.inner.obstacle_count() as u32
+    }
+
+    /// Paint (`on = true`) or erase (`on = false`) a filled disk of wall cells at
+    /// `(x, y)` with the given `radius` (cells, toroidal). In-place — never grows
+    /// linear memory, so the field/food/obstacle views stay valid (no re-fetch).
+    pub fn paint_obstacle(&mut self, x: f32, y: f32, radius: f32, on: bool) {
+        self.inner.paint_obstacle(x, y, radius, on);
+    }
+
+    /// Clear every wall, returning the world to fully open. In-place (no re-fetch).
+    pub fn clear_obstacles(&mut self) {
+        self.inner.clear_obstacles();
+    }
+
+    /// Add a persistent endpoint food source at `(x, y)` with `radius` (cells) — a
+    /// well that keeps regrowing and draws food-attracted agents, doubling as a
+    /// reachability seed/target and a renderer marker. **Reset-class:** it
+    /// recomputes the food caps and refills food, so re-fetch the food view after
+    /// (the pointer is stable; the contents change).
+    pub fn add_endpoint(&mut self, x: f32, y: f32, radius: f32) {
+        self.inner.add_endpoint(x, y, radius);
+    }
+
+    /// Remove every endpoint and recompute the food caps. Reset-class (re-fetch the
+    /// food view after).
+    pub fn clear_endpoints(&mut self) {
+        self.inner.clear_endpoints();
+    }
+
+    /// Number of endpoint food sources.
+    pub fn endpoint_count(&self) -> u32 {
+        self.inner.endpoint_count() as u32
+    }
+
+    /// `x` of endpoint `i` (cells), or `0.0` if out of range — for the renderer's
+    /// endpoint markers.
+    pub fn endpoint_x(&self, i: u32) -> f32 {
+        self.inner.endpoint_x(i as usize)
+    }
+
+    /// `y` of endpoint `i` (cells), or `0.0` if out of range.
+    pub fn endpoint_y(&self, i: u32) -> f32 {
+        self.inner.endpoint_y(i as usize)
+    }
+
+    /// Radius of endpoint `i` (cells), or `0.0` if out of range.
+    pub fn endpoint_radius(&self, i: u32) -> f32 {
+        self.inner.endpoint_radius(i as usize)
+    }
+
+    /// Set `species`' food-attraction (chemotaxis) weight. `0.0` (the default) =
+    /// pure self-trail Physarum; a positive value steers agents up the food gradient
+    /// toward endpoints. Takes effect next tick; no rebuild.
+    pub fn set_food_attraction(&mut self, species: u32, weight: f32) {
+        let s = species as usize;
+        let mut p = self.inner.params(s);
+        p.food_attraction = weight;
+        self.inner.set_params(s, p);
+    }
+
+    /// `species`' current food-attraction weight (for the parameter panel).
+    pub fn food_attraction(&self, species: u32) -> f32 {
+        self.inner.params(species as usize).food_attraction
+    }
+
+    /// Set the reachability threshold — the fraction of the current combined
+    /// `field_max` a cell's combined trail must reach to count as network. Clamped to
+    /// `[0, 1]`. Affects only the on-demand metric, not the sim.
+    pub fn set_network_threshold(&mut self, t: f32) {
+        self.inner.set_network_threshold(t);
+    }
+
+    /// Current reachability threshold (fraction of combined `field_max`).
+    pub fn network_threshold(&self) -> f32 {
+        self.inner.network_threshold()
+    }
+
+    /// How many endpoints (including endpoint 0) are reachable from endpoint 0 along
+    /// the thresholded combined trail network (open cells only, toroidal). `0` if
+    /// there are no endpoints. On-demand read-only reduction (does not tick the sim).
+    pub fn endpoints_connected(&mut self) -> u32 {
+        self.inner.endpoints_connected()
+    }
+
+    /// Number of cells in the reachable network from endpoint 0 — a length/cost proxy
+    /// for the connecting structure. `0` if no endpoints or no above-threshold
+    /// network. On-demand read-only reduction.
+    pub fn network_cost(&mut self) -> u32 {
+        self.inner.network_cost()
+    }
+
+    /// Load the built-in "Physarum solves the maze" scenario: a wall maze, two
+    /// endpoint food wells, food-attraction on, and a population seeded in the open
+    /// left corridor. **Reset-class** — it rewrites obstacles, endpoints, food, and
+    /// the population (all in place, no reallocation), so re-fetch the
+    /// field/food/obstacle views afterward (pointers stay valid; contents change).
+    pub fn load_maze_demo(&mut self) {
+        self.inner.load_maze_demo();
+    }
 }

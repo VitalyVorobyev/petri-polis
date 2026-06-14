@@ -26,12 +26,17 @@ makes alone.
 [ crate: petri-core ]  pure Rust, native-testable
     field:  [Vec<f32>; SPECIES] one trail map per species — the thing you see
     fieldB: Vec<f32>            shared blur scratch, reused per species
-    food:   Vec<f32>            SHARED nutrient field; foodCap = static regrowing patches
+    food:   Vec<f32>            SHARED nutrient field; foodCap = patches + endpoint wells
+    obstacles: Vec<u8>          0/1 wall mask the trail can't enter (default all-0)
+    endpoints: Vec<Endpoint>    persistent food wells to connect (sources/sinks)
+    visited/queue: Vec<u32>     pre-allocated scratch for the on-demand reachability BFS
     agents (SoA): x, y, heading, energy: Vec<f32> + species: Vec<u8>
     params/ecology: per-species; rng: seeded PRNG (xoshiro256**) → deterministic
-    tick(): per agent (by species) { sense/deposit OWN trail → steer → move(wrap)
+    tick(): per agent (by species) { sense OWN trail (+ food·food_attraction; walls→0)
+                        → steer → move(wrap; refused by walls) → deposit
                         → metabolism → eat SHARED food → reproduce / die-feeds-food }
-            then per species: diffuse (separable blur) + decay; food regrows to cap
+            then per species: diffuse (separable blur) + decay (held 0 under walls);
+                              food regrows to cap
         |
 [ crate: petri-wasm ]  thin wasm-bindgen layer
     Sim::new(w, h, seed)
@@ -41,13 +46,20 @@ makes alone.
     Sim::set_params(species, ...) ; set_ecology(species, ...)    // LIVE, no rebuild
     Sim::spawn(x, y, n, pattern, species) ; reset(seed)
     Sim::agent_count() ; species_population(species)   // dynamic — rises/falls with the cycle
-        |  JS: new Float32Array(wasm.memory.buffer, ptr, len)
+    Sim::obstacle_ptr() ; obstacle_len()               // zero-copy 0/1 wall mask (u8)
+    Sim::paint_obstacle(x,y,r,on) ; clear_obstacles()  // edit walls in place
+    Sim::add_endpoint(x,y,r) ; clear_endpoints() ; endpoint_count()/_x/_y/_radius
+    Sim::load_maze_demo()                              // reset-class built-in scenario
+    Sim::set_food_attraction(species,w) ; set_network_threshold(t)
+    Sim::endpoints_connected() ; network_cost()        // on-demand reachability read
+        |  JS: new Float32Array(buffer, ptr, len) for fields; Uint8Array(...) for the mask
 [ TS app ]  WebGL2 + Tweakpane
-    each frame: upload each species' trail + food → R32F textures
+    each frame: upload each species' trail + food → R32F, obstacle mask → R8
+                → walls render as a dim slate underlay (below the bloom threshold, no glow)
                 → colormap: cyan (sp0) + magenta (sp1), additive → white where they overlap,
                   over a dim food substrate; per-species auto-exposure
                 → bloom (bright-pass → separable gaussian → additive composite)
-                → present (full-bleed canvas)
+                → additive amber rings mark the endpoints → present (full-bleed canvas)
 ```
 
 Single static-site deploy: fast Rust where the work is, GPU where the beauty is, no backend.
@@ -105,6 +117,23 @@ two default sets are tuned to different niches (species 0 a fine, fast mesh; spe
 thick veins) so they coexist instead of one excluding the other. Per-species live params via
 `set_params(species, …)` / `set_ecology(species, …)`.
 
+## World geography (sources, sinks & obstacles)
+
+The toroidal arena gains optional structure. An `obstacles: Vec<u8>` mask (0 open / 1 wall,
+allocated once and never grown) makes cells impassable: a sensor over a wall reads 0, a move that
+would enter a wall is refused (the agent stays and turns once), and the diffuse/decay pass holds
+wall cells at 0 so the glow can't seep through. `endpoints` are persistent food wells —
+`add_endpoint` bakes a high, flat-topped source into `food_cap` (combined with the random patches
+by `max`), so a well stays fed however hard it is grazed. A per-species `food_attraction` adds the
+food under each sensor to the trail it reads (`sensed = trail + food_attraction · food`), turning
+the steer-toward-the-strongest rule into chemotaxis up the food gradient — the mechanism that lets
+the colony find and connect the wells. `load_maze_demo` assembles a reproducible serpentine-wall
+scenario with two wells and chemotaxis on.
+
+All of it is additive: with no walls, no endpoints, and `food_attraction = 0` (the defaults) the
+new branches are never entered — no extra PRNG draw, no food term — so a run is bit-for-bit
+identical to one without geography and the golden-checksum test is unchanged.
+
 ## Rendering (petri-render)
 
 - Each species' trail is single-channel `f32` → upload as an `R32F` texture each frame.
@@ -116,6 +145,9 @@ thick veins) so they coexist instead of one excluding the other. Per-species liv
 - **Food substrate:** the food field uploads as a second `R32F` texture and renders as a dim,
   desaturated underlay beneath the cyan trail — depletion darkens it, regrowth re-greens it, so
   the boom/bust cycle is legible. Kept below the bloom threshold so only the trail glows.
+- **Geography:** the obstacle mask uploads as an `R8` texture; wall cells render as a dim slate
+  underlay kept below the bloom threshold (no glow), and each endpoint draws an additive amber
+  ring so the sources/sinks read at a glance.
 - Beauty bar: smooth gradients, soft additive glow, no hard pixel edges at the target zoom.
 
 ## Measurement & sharing (petri-render + petri-wasm)
@@ -129,6 +161,10 @@ is unperturbed and determinism holds), plus point queries (`trail_at`, `food_at`
   per-species population and trail mass, food total and coverage, **sampled against
   `tick_count`** (not wall-clock) so a series is reproducible across machines.
 - **Export** — the recorded series downloads as CSV/JSON for offline analysis.
+- **Reachability** — on demand (never in `tick`), the combined trail field is thresholded at
+  `network_threshold` and flood-filled (4-connected, toroidal) from endpoint 0 over pre-allocated
+  scratch; `endpoints_connected` (how many wells the network spans) and `network_cost` (cells in
+  the connecting structure) read out whether — and how cheaply — the maze is solved.
 - **Inspector** — hovering reads the trail/food under the cursor and the nearest agent's
   species and energy.
 - **Sharing** — the seed and every per-species parameter encode into the URL hash; opening the
@@ -195,6 +231,27 @@ two-color picture. *Rejected:* a Forager→Seeder→Builder role-transition pipe
 lifecycle mechanic, harder to keep deterministic and legible) and direct cross-species trail
 sensing (predator/prey) — both add coupling the gate doesn't need yet. Start at two; the
 `SPECIES` constant generalizes when a third earns its place.
+
+**D11 — World geography is additive and inert by default (obstacles + chemotaxis).** A `u8` wall
+mask (held at 0 under walls, sensed as 0, refusing moves) plus a per-species `food_attraction`
+chemotaxis term give the colony walls to route around and food wells to seek — the ingredients of
+the Physarum maze demo. Every new path is gated on geometry/attraction actually being present, so
+the empty-world run stays bit-for-bit identical and the golden checksum is unchanged. *Rejected:* a
+separate repulsion field for walls (a second full field for a boolean fact); always-on food sensing
+(shifts the baseline and taxes every tick for a feature most runs don't use).
+
+**D12 — Endpoints are persistent food wells baked into the food cap, not a new injection path.**
+`add_endpoint` raises `food_cap` (a flat core + Gaussian skirt, combined by `max`) and the existing
+regrow-toward-cap rule keeps the well full, so a source needs no new per-tick code and stays
+deterministic. *Rejected:* a separate constant-injection term per endpoint.
+
+**D13 — Reachability is an on-demand, read-only BFS over pre-allocated scratch — not a tick cost.**
+A thresholded flood-fill (4-connected, toroidal) from endpoint 0 answers "are the wells connected,
+and how large is the connecting network" only when asked — the renderer samples it at the sparkline
+cadence — so the hot loop and the no-alloc/determinism invariants are untouched. One reachability
+number reads out the maze demo; richer topology metrics are not computed in the tick. *Rejected:*
+folding a graph search into every `tick` (heavy, and the answer is needed at UI cadence, not tick
+cadence).
 
 ## Out of current scope (not deleted)
 

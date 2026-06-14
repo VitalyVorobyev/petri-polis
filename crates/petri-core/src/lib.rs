@@ -124,6 +124,12 @@ pub struct Params {
     /// Diffusion weight of the center tap in the separable 3-tap blur, in `[0, 1]`.
     /// The two neighbor taps share `(1 - diffuse_weight)`. `1.0` = no blur.
     pub diffuse_weight: f32,
+    /// Chemotaxis weight: how strongly the agent steers toward food. Each of the
+    /// three sensor readings gains `food_attraction * food_sample` (the food field
+    /// sampled at that sensor), so a positive value biases agents up the food
+    /// gradient toward endpoints. **Unitless** (food units → field-comparable
+    /// units). `0.0` = pure self-trail Physarum (the default; food is ignored).
+    pub food_attraction: f32,
 }
 
 impl Params {
@@ -146,6 +152,7 @@ impl Params {
                 deposit_amount: 7.0,   // heavy trail → thick, persistent veins
                 decay: 0.92,           // slow fade → long-lived trunk network
                 diffuse_weight: 0.55,  // center tap weight; neighbors share the rest
+                food_attraction: 0.0,  // off by default → pure self-trail Physarum
             },
             // Species 0 (and any out-of-range index) — the fine, fast mesh.
             _ => Self {
@@ -156,6 +163,7 @@ impl Params {
                 deposit_amount: 4.0,  // light trail → delicate filaments
                 decay: 0.88,          // faster fade → quick-turnover mesh
                 diffuse_weight: 0.5,  // center tap weight; neighbors share the rest
+                food_attraction: 0.0, // off by default → pure self-trail Physarum
             },
         }
     }
@@ -246,6 +254,23 @@ const FOOD_PATCH_RADIUS_FRAC_MAX: f32 = 0.14;
 /// than this much food — a small threshold that ignores near-empty cells.
 const FOOD_COVERAGE_EPSILON: f32 = 0.02;
 
+/// Default reachability threshold: a cell joins the network if its combined trail
+/// (`field[0] + field[1]`) is at least this fraction of the current combined
+/// field max. The network-cost / connectivity reduction flood-fills over cells at
+/// or above this. Live-tunable via [`Sim::set_network_threshold`].
+const DEFAULT_NETWORK_THRESHOLD: f32 = 0.05;
+
+/// A persistent endpoint food source: a circular region (toroidal) whose
+/// `food_cap` is pinned high, so it keeps regrowing and draws chemotactic agents.
+/// Endpoints double as the seeds/targets of the reachability metric and as the
+/// markers the renderer draws. Positions are in cells; `radius` is in cells.
+#[derive(Clone, Copy, Debug)]
+struct Endpoint {
+    x: f32,
+    y: f32,
+    radius: f32,
+}
+
 /// Starting energy of every initial / spawned agent, as a fraction of the
 /// reproduction threshold — high enough not to starve immediately, low enough not
 /// to reproduce on tick one.
@@ -304,6 +329,20 @@ pub struct Sim {
     /// Max food value after the most recent tick (for renderer normalization).
     food_max: f32,
 
+    /// Obstacle mask, row-major `width * height`: `0` = open, `1` = wall. Allocated
+    /// once at `new` (all-open) and never reallocated (JS aliases it for rendering).
+    /// Walls block agent moves and read as zero trail at sensors. Painted/cleared
+    /// through the obstacle API; `reset` clears it back to all-open.
+    obstacles: Vec<u8>,
+    /// Count of wall cells in `obstacles`. When `0`, every obstacle code path is
+    /// skipped entirely, so an empty mask draws **zero** extra RNG and leaves a tick
+    /// byte-identical to a build without obstacles (the determinism guard).
+    obstacle_count: usize,
+    /// Persistent endpoint food sources (targets of the reachability metric and the
+    /// renderer's markers). Empty by default. Each pins `food_cap` high within its
+    /// radius; changing them recomputes the caps.
+    endpoints: Vec<Endpoint>,
+
     /// Per-species total trail mass (Σ of that species' field) after the most
     /// recent field pass. `f64` so summing all cells of a high-deposit field keeps
     /// full precision. Folded in during the field pass — no extra full-field scan.
@@ -329,6 +368,17 @@ pub struct Sim {
     rng: Rng,
     params: [Params; SPECIES],
     ecology: [Ecology; SPECIES],
+
+    /// Reachability threshold as a fraction of the current combined `field_max`.
+    /// Live-tunable; defaults to [`DEFAULT_NETWORK_THRESHOLD`].
+    network_threshold: f32,
+    /// Flood-fill visited/label scratch, `width * height`. Pre-allocated at `new`,
+    /// reused by the on-demand reachability reduction — never grows, never touched
+    /// inside `tick`. A cell holds `1` once the fill has visited it, else `0`.
+    visited: Vec<u32>,
+    /// Flood-fill BFS-queue scratch, `width * height` (a worst-case full frontier).
+    /// Pre-allocated at `new`, reused by the reachability reduction.
+    bfs_queue: Vec<u32>,
 }
 
 impl Sim {
@@ -358,6 +408,9 @@ impl Sim {
             food: vec![0.0; cells],
             food_cap: vec![0.0; cells],
             food_max: 0.0,
+            obstacles: vec![0u8; cells],
+            obstacle_count: 0,
+            endpoints: Vec::new(),
             trail_mass: [0.0; SPECIES],
             food_total: 0.0,
             food_coverage: 0.0,
@@ -369,6 +422,9 @@ impl Sim {
             rng: Rng::seed(seed),
             params,
             ecology,
+            network_threshold: DEFAULT_NETWORK_THRESHOLD,
+            visited: vec![0u32; cells],
+            bfs_queue: vec![0u32; cells],
         };
         // RNG draw order is load-bearing for determinism: patches first, then the
         // initial population. `reset` mirrors this exact order.
@@ -586,6 +642,16 @@ impl Sim {
         for v in self.field_b.iter_mut() {
             *v = 0.0;
         }
+        // Geometry is world state: a reset returns to an empty, all-open world.
+        // Clearing the mask back to zero restores byte-identity with a fresh `new`
+        // (which has no obstacles), keeping `reset` a true world-reset.
+        if self.obstacle_count != 0 {
+            for v in self.obstacles.iter_mut() {
+                *v = 0;
+            }
+            self.obstacle_count = 0;
+        }
+        self.endpoints.clear();
         self.x.clear();
         self.y.clear();
         self.heading.clear();
@@ -707,6 +773,11 @@ impl Sim {
             }
         }
 
+        // Bake endpoint sources into the caps (combined by max), so each endpoint is
+        // a persistent, full-strength food well its radius wide. No RNG: endpoints
+        // are explicit geometry, not random patches.
+        self.bake_endpoint_caps();
+
         // Start abundant: food begins at its cap so the first boom can run.
         self.food.copy_from_slice(&self.food_cap);
         let mut max = 0.0f32;
@@ -724,6 +795,495 @@ impl Sim {
         self.food_max = max;
         self.food_total = total;
         self.food_coverage = covered as f32 / self.food.len() as f32;
+    }
+
+    /// Max each endpoint's source into `food_cap`: a clamped Gaussian (toroidal
+    /// distance) peaking at [`FOOD_PATCH_PEAK`] at the center and flooring to that
+    /// same peak out to its `radius`, so an endpoint is a solid, persistent food
+    /// well that survives depletion (its cap keeps regrowing it). No RNG — endpoints
+    /// are explicit geometry. A no-op when there are no endpoints.
+    fn bake_endpoint_caps(&mut self) {
+        if self.endpoints.is_empty() {
+            return;
+        }
+        let w = self.width;
+        let h = self.height;
+        let wf = w as f32;
+        let hf = h as f32;
+        for ep in self.endpoints.iter() {
+            let radius = ep.radius.max(1.0);
+            // Soft skirt just outside the core so the well blends into the field.
+            let inv_two_sigma2 = 1.0 / (2.0 * radius * radius);
+            for row in 0..h {
+                let dy_raw = (row as f32 + 0.5 - ep.y).abs();
+                let dy = dy_raw.min(hf - dy_raw);
+                let base = row * w;
+                for col in 0..w {
+                    let dx_raw = (col as f32 + 0.5 - ep.x).abs();
+                    let dx = dx_raw.min(wf - dx_raw);
+                    let d2 = dx * dx + dy * dy;
+                    // Solid core out to the radius, soft Gaussian skirt beyond.
+                    let g = if d2 <= radius * radius {
+                        FOOD_PATCH_PEAK
+                    } else {
+                        FOOD_PATCH_PEAK * (-(d2) * inv_two_sigma2).exp()
+                    };
+                    let cell = &mut self.food_cap[base + col];
+                    if g > *cell {
+                        *cell = g;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Recompute `food_cap` from the current patches **and** endpoints and refill
+    /// `food` to the fresh caps — the cap-recompute hook every geometry edit
+    /// (`add_endpoint`/`clear_endpoints`) routes through. This re-runs the RNG-driven
+    /// patch generation, so it re-seeds the patches from the current PRNG state; it
+    /// is a world-geometry operation (reset-class), not a per-frame one.
+    fn recompute_food_caps(&mut self) {
+        self.generate_food_patches();
+    }
+
+    // --- Obstacle mask: paint/clear walls. In-place writes (the mask buffer is
+    // fixed-size); `obstacle_count` tracks occupancy so an empty mask skips every
+    // wall code path and stays byte-identical to a build with no obstacles. ---
+
+    /// Read-only view of the obstacle mask (row-major, `len == width * height`,
+    /// `0` = open, `1` = wall). `petri-wasm` hands JS a zero-copy pointer here.
+    pub fn obstacles(&self) -> &[u8] {
+        &self.obstacles
+    }
+
+    /// Number of wall cells currently set. `0` means the world is fully open and
+    /// every obstacle code path is skipped (the determinism fast path).
+    pub fn obstacle_count(&self) -> usize {
+        self.obstacle_count
+    }
+
+    /// Paint (or erase) a filled disk of obstacle cells centered at `(x, y)` with
+    /// the given `radius` (cells, toroidal). `on = true` sets walls, `false` clears
+    /// them. In-place — no reallocation. Updates `obstacle_count`.
+    pub fn paint_obstacle(&mut self, x: f32, y: f32, radius: f32, on: bool) {
+        let w = self.width;
+        let h = self.height;
+        let wf = w as f32;
+        let hf = h as f32;
+        let r = radius.max(0.0);
+        let r2 = r * r;
+        let val: u8 = if on { 1 } else { 0 };
+        for row in 0..h {
+            let dy_raw = (row as f32 + 0.5 - y).abs();
+            let dy = dy_raw.min(hf - dy_raw);
+            let base = row * w;
+            for col in 0..w {
+                let dx_raw = (col as f32 + 0.5 - x).abs();
+                let dx = dx_raw.min(wf - dx_raw);
+                if dx * dx + dy * dy <= r2 {
+                    let cell = &mut self.obstacles[base + col];
+                    if *cell != val {
+                        if on {
+                            self.obstacle_count += 1;
+                        } else {
+                            self.obstacle_count -= 1;
+                        }
+                        *cell = val;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Paint (or erase) an axis-aligned rectangle of obstacle cells. `x0..x1` and
+    /// `y0..y1` are inclusive cell-coordinate ranges (auto-ordered). No wrap — used
+    /// to lay maze walls. In-place; updates `obstacle_count`.
+    fn paint_obstacle_rect(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, on: bool) {
+        let w = self.width;
+        let h = self.height;
+        let (xa, xb) = (x0.min(x1), x0.max(x1).min(w - 1));
+        let (ya, yb) = (y0.min(y1), y0.max(y1).min(h - 1));
+        let val: u8 = if on { 1 } else { 0 };
+        for row in ya..=yb {
+            let base = row * w;
+            for col in xa..=xb {
+                let cell = &mut self.obstacles[base + col];
+                if *cell != val {
+                    if on {
+                        self.obstacle_count += 1;
+                    } else {
+                        self.obstacle_count -= 1;
+                    }
+                    *cell = val;
+                }
+            }
+        }
+    }
+
+    /// Clear every wall, returning the world to fully open. In-place.
+    pub fn clear_obstacles(&mut self) {
+        if self.obstacle_count != 0 {
+            for v in self.obstacles.iter_mut() {
+                *v = 0;
+            }
+            self.obstacle_count = 0;
+        }
+    }
+
+    // --- Endpoint food sources: persistent wells that double as reachability
+    // seeds/targets and renderer markers. Editing them recomputes the food caps. ---
+
+    /// Add a persistent endpoint food source at `(x, y)` with the given `radius`
+    /// (cells). Recomputes `food_cap`/`food` so the well takes effect immediately.
+    /// Reset-class: it refills food and re-runs patch generation, so JS should
+    /// re-fetch the food view afterward (the pointer is stable, but the contents
+    /// change).
+    pub fn add_endpoint(&mut self, x: f32, y: f32, radius: f32) {
+        let w = self.width as f32;
+        let h = self.height as f32;
+        self.endpoints.push(Endpoint {
+            x: x.rem_euclid(w),
+            y: y.rem_euclid(h),
+            radius: radius.max(1.0),
+        });
+        self.recompute_food_caps();
+    }
+
+    /// Remove every endpoint and recompute the food caps (back to patches only).
+    pub fn clear_endpoints(&mut self) {
+        if !self.endpoints.is_empty() {
+            self.endpoints.clear();
+            self.recompute_food_caps();
+        }
+    }
+
+    /// Number of endpoint food sources.
+    pub fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
+    /// `x` of endpoint `i` (cells), or `0.0` if out of range.
+    pub fn endpoint_x(&self, i: usize) -> f32 {
+        self.endpoints.get(i).map_or(0.0, |e| e.x)
+    }
+
+    /// `y` of endpoint `i` (cells), or `0.0` if out of range.
+    pub fn endpoint_y(&self, i: usize) -> f32 {
+        self.endpoints.get(i).map_or(0.0, |e| e.y)
+    }
+
+    /// Radius of endpoint `i` (cells), or `0.0` if out of range.
+    pub fn endpoint_radius(&self, i: usize) -> f32 {
+        self.endpoints.get(i).map_or(0.0, |e| e.radius)
+    }
+
+    // --- Chemotaxis + reachability knobs ---
+
+    /// Reachability threshold as a fraction of the current combined `field_max`.
+    pub fn network_threshold(&self) -> f32 {
+        self.network_threshold
+    }
+
+    /// Set the reachability threshold (fraction of combined `field_max`). Clamped to
+    /// a sane `[0, 1]` window; takes effect on the next reachability query.
+    pub fn set_network_threshold(&mut self, t: f32) {
+        self.network_threshold = t.clamp(0.0, 1.0);
+    }
+
+    /// Build a clean, reproducible "Physarum solves the maze" scenario from the
+    /// current PRNG state: clear the random food patches, lay a simple wall maze
+    /// into the obstacle mask, place two endpoint food wells in opposite corridors,
+    /// turn on food-attraction for both species, and respawn the population between
+    /// the endpoints so it must grow a connecting network through the maze.
+    ///
+    /// Reset-class — it rewrites obstacles, endpoints, food, and the agent arrays
+    /// (all in place, no reallocation), so JS must re-fetch its field/food/obstacle
+    /// views afterward (pointers stay valid; contents and the population change).
+    pub fn load_maze_demo(&mut self) {
+        let w = self.width;
+        let h = self.height;
+        let wf = w as f32;
+        let hf = h as f32;
+
+        // --- Fresh world: open mask, no endpoints, no random patches. ---
+        self.clear_obstacles();
+        self.endpoints.clear();
+        self.tick_count = 0;
+        self.field_max = [0.0; SPECIES];
+        self.food_max = 0.0;
+        self.trail_mass = [0.0; SPECIES];
+        self.food_total = 0.0;
+        self.food_coverage = 0.0;
+        for f in self.field.iter_mut() {
+            for v in f.iter_mut() {
+                *v = 0.0;
+            }
+        }
+        for v in self.field_b.iter_mut() {
+            *v = 0.0;
+        }
+        // Caps start empty: the maze relies on the two endpoint wells only, so a
+        // crashed front can't shelter in a random patch and ignore the maze.
+        for v in self.food_cap.iter_mut() {
+            *v = 0.0;
+        }
+
+        // --- Lay a simple maze: three vertical walls with offset gaps, forcing a
+        // serpentine path between the left and right corridors. Wall thickness and
+        // gaps scale with the field so the layout reproduces at any size. ---
+        let t = (w / 64).max(1); // wall thickness in cells
+        let gap = (h / 6).max(3); // corridor gap height
+        let margin = h / 8; // keep gaps off the top/bottom edges
+        let wall_xs = [w / 4, w / 2, (3 * w) / 4];
+        for (k, &wx) in wall_xs.iter().enumerate() {
+            let x0 = wx.saturating_sub(t / 2);
+            let x1 = (wx + t / 2).min(w - 1);
+            // Alternate the gap between the top third and the bottom third so the
+            // single open path zig-zags.
+            let gap_center = if k % 2 == 0 {
+                margin + gap / 2
+            } else {
+                h - margin - gap / 2
+            };
+            let g0 = gap_center.saturating_sub(gap / 2);
+            let g1 = (gap_center + gap / 2).min(h - 1);
+            // Full-height wall, then carve the gap back open.
+            self.paint_obstacle_rect(x0, 0, x1, h - 1, true);
+            self.paint_obstacle_rect(x0, g0, x1, g1, false);
+        }
+
+        // --- Two endpoint wells in the far corridors (left edge / right edge),
+        // each clear of the walls. ---
+        let r = (wf.min(hf) * 0.05).max(3.0);
+        self.endpoints.push(Endpoint {
+            x: wf * 0.08,
+            y: (margin + gap / 2) as f32,
+            radius: r,
+        });
+        self.endpoints.push(Endpoint {
+            x: wf * 0.92,
+            y: (margin + gap / 2) as f32,
+            radius: r,
+        });
+        self.bake_endpoint_caps();
+        self.food.copy_from_slice(&self.food_cap);
+        // Refresh the food summary so the metrics are consistent before the first tick.
+        let mut fmax = 0.0f32;
+        let mut ftotal = 0.0f64;
+        let mut fcov = 0usize;
+        for &v in self.food.iter() {
+            if v > fmax {
+                fmax = v;
+            }
+            ftotal += v as f64;
+            if v > FOOD_COVERAGE_EPSILON {
+                fcov += 1;
+            }
+        }
+        self.food_max = fmax;
+        self.food_total = ftotal;
+        self.food_coverage = fcov as f32 / self.food.len() as f32;
+
+        // --- Chemotaxis on for both species so they navigate toward the wells. ---
+        for s in 0..SPECIES {
+            self.params[s].food_attraction = 6.0;
+        }
+
+        // --- Respawn the population in the open left corridor, near endpoint 0, so
+        // the network must thread the maze to reach endpoint 1. Agents are seeded
+        // inside the corridor and only in open (non-wall) cells: a rejection sample
+        // drawing from the sim PRNG in a fixed order (the determinism contract). The
+        // species alternate round-robin (no RNG draw), matching `spawn_initial`. ---
+        self.x.clear();
+        self.y.clear();
+        self.heading.clear();
+        self.energy.clear();
+        self.species.clear();
+        let count = (w * h / 8).min(self.capacity());
+        // Corridor box: the left bay, from the left edge to just before the first
+        // wall, clear of the top/bottom edges.
+        let bx0 = wf * 0.02;
+        let bx1 = (wall_xs[0] as f32) - (t as f32) - 2.0;
+        let by0 = 2.0;
+        let by1 = hf - 2.0;
+        let bw = (bx1 - bx0).max(1.0);
+        let bh = (by1 - by0).max(1.0);
+        for i in 0..count {
+            let s = i % SPECIES;
+            // Rejection-sample an open cell in the corridor box. A bounded retry keeps
+            // the RNG draw count finite and deterministic; the fallback is endpoint 0.
+            let mut px = self.endpoint_x(0);
+            let mut py = self.endpoint_y(0);
+            for _ in 0..16 {
+                let tx = bx0 + self.rng.next_f32() * bw;
+                let ty = by0 + self.rng.next_f32() * bh;
+                if self.obstacles[self.idx(tx, ty)] == 0 {
+                    px = tx;
+                    py = ty;
+                    break;
+                }
+            }
+            self.x.push(px.rem_euclid(wf));
+            self.y.push(py.rem_euclid(hf));
+            self.heading.push(self.rng.range(TAU));
+            self.energy.push(self.initial_energy(s));
+            self.species.push(s as u8);
+        }
+    }
+
+    /// Reachability reduction over the **combined** trail field. Floods (4-connected,
+    /// toroidal — matching the sim's wrap) over open (non-wall) cells whose combined
+    /// trail `field[0] + field[1]` is at least `network_threshold * max_combined`,
+    /// seeded from the cells under endpoint 0. Fills the `visited` scratch as a side
+    /// effect. Returns `(endpoints_connected, network_cost)`:
+    /// - `endpoints_connected`: how many endpoints (including endpoint 0) have at
+    ///   least one cell inside their radius in the visited set; `0` if no endpoints.
+    /// - `network_cost`: number of visited cells (a length/cost proxy).
+    ///
+    /// Read-only: no RNG, no state mutation beyond the pre-allocated scratch, never
+    /// called inside `tick`. Allocation-free (reuses `visited` + `bfs_queue`).
+    fn reachability(&mut self) -> (u32, u32) {
+        let w = self.width;
+        let h = self.height;
+        let n = w * h;
+
+        // No endpoints → nothing to connect.
+        if self.endpoints.is_empty() {
+            return (0, 0);
+        }
+
+        // Combined field max → absolute threshold.
+        let mut max_combined = 0.0f32;
+        for k in 0..n {
+            let v = self.field[0][k] + self.field[1][k];
+            if v > max_combined {
+                max_combined = v;
+            }
+        }
+        // An empty (or all-zero) field has no network at all — bail before the fill
+        // so a zero threshold doesn't sweep in every open cell.
+        if max_combined <= 0.0 {
+            for v in self.visited.iter_mut() {
+                *v = 0;
+            }
+            return (0, 0);
+        }
+        // Strictly-positive floor so a literal-0 threshold still excludes empty cells.
+        let thresh = (self.network_threshold * max_combined).max(f32::MIN_POSITIVE);
+
+        // Reset visited scratch.
+        for v in self.visited.iter_mut() {
+            *v = 0;
+        }
+
+        // Seed the queue from open, above-threshold cells under endpoint 0.
+        let mut head = 0usize;
+        let mut tail = 0usize;
+        {
+            let ep = self.endpoints[0];
+            let r2 = ep.radius * ep.radius;
+            let wf = w as f32;
+            let hf = h as f32;
+            for row in 0..h {
+                let dy_raw = (row as f32 + 0.5 - ep.y).abs();
+                let dy = dy_raw.min(hf - dy_raw);
+                let base = row * w;
+                for col in 0..w {
+                    let dx_raw = (col as f32 + 0.5 - ep.x).abs();
+                    let dx = dx_raw.min(wf - dx_raw);
+                    if dx * dx + dy * dy > r2 {
+                        continue;
+                    }
+                    let idx = base + col;
+                    if self.obstacles[idx] != 0 {
+                        continue;
+                    }
+                    if self.field[0][idx] + self.field[1][idx] < thresh {
+                        continue;
+                    }
+                    if self.visited[idx] == 0 {
+                        self.visited[idx] = 1;
+                        self.bfs_queue[tail] = idx as u32;
+                        tail += 1;
+                    }
+                }
+            }
+        }
+
+        // 4-connected toroidal flood fill over open, above-threshold cells.
+        let mut cost = tail as u32;
+        while head < tail {
+            let idx = self.bfs_queue[head] as usize;
+            head += 1;
+            let col = idx % w;
+            let row = idx / w;
+            // Toroidal 4-neighborhood.
+            let left = if col == 0 { w - 1 } else { col - 1 };
+            let right = if col == w - 1 { 0 } else { col + 1 };
+            let up = if row == 0 { h - 1 } else { row - 1 };
+            let down = if row == h - 1 { 0 } else { row + 1 };
+            let neighbors = [
+                row * w + left,
+                row * w + right,
+                up * w + col,
+                down * w + col,
+            ];
+            for &nidx in neighbors.iter() {
+                if self.visited[nidx] != 0 {
+                    continue;
+                }
+                if self.obstacles[nidx] != 0 {
+                    continue;
+                }
+                if self.field[0][nidx] + self.field[1][nidx] < thresh {
+                    continue;
+                }
+                self.visited[nidx] = 1;
+                self.bfs_queue[tail] = nidx as u32;
+                tail += 1;
+                cost += 1;
+            }
+        }
+
+        // Count how many endpoints have a visited cell inside their radius.
+        let wf = w as f32;
+        let hf = h as f32;
+        let mut connected = 0u32;
+        for ep in self.endpoints.iter() {
+            let r2 = ep.radius * ep.radius;
+            let mut hit = false;
+            'scan: for row in 0..h {
+                let dy_raw = (row as f32 + 0.5 - ep.y).abs();
+                let dy = dy_raw.min(hf - dy_raw);
+                let base = row * w;
+                for col in 0..w {
+                    let dx_raw = (col as f32 + 0.5 - ep.x).abs();
+                    let dx = dx_raw.min(wf - dx_raw);
+                    if dx * dx + dy * dy <= r2 && self.visited[base + col] != 0 {
+                        hit = true;
+                        break 'scan;
+                    }
+                }
+            }
+            if hit {
+                connected += 1;
+            }
+        }
+        (connected, cost)
+    }
+
+    /// How many endpoints (including endpoint 0) are reachable from endpoint 0 along
+    /// the thresholded combined trail network (open cells only, toroidal). `0` if
+    /// there are no endpoints. See [`Sim::reachability`]. On-demand, read-only.
+    pub fn endpoints_connected(&mut self) -> u32 {
+        self.reachability().0
+    }
+
+    /// Number of cells in the reachable network from endpoint 0 — a length/cost
+    /// proxy for the connecting structure. `0` if there are no endpoints or no
+    /// network above threshold. On-demand, read-only.
+    pub fn network_cost(&mut self) -> u32 {
+        self.reachability().1
     }
 
     /// Advance the simulation one tick: every agent senses, steers, moves
@@ -750,6 +1310,9 @@ impl Sim {
         let w = self.width as f32;
         let h = self.height as f32;
         let n = self.x.len();
+        // Geometry fast-path flags: when both are off, every branch below collapses
+        // to exactly today's arithmetic and RNG draw order (byte-identity guard).
+        let has_walls = self.obstacle_count != 0;
 
         // --- Phase 1: sense → steer → move → eat → deposit, pay metabolism. ---
         for i in 0..n {
@@ -761,10 +1324,40 @@ impl Sim {
             let cy = self.y[i];
 
             // 1. Sense this species' own field at three points at sensor_distance:
-            //    center, left, right.
-            let f = self.sense(s, cx, cy, heading, p.sensor_distance);
-            let l = self.sense(s, cx, cy, heading - p.sensor_angle, p.sensor_distance);
-            let r = self.sense(s, cx, cy, heading + p.sensor_angle, p.sensor_distance);
+            //    center, left, right. With obstacles present, a sensor over a wall
+            //    reads 0 (no trail). With food-attraction on, each reading gains
+            //    `food_attraction * food` at the sensor (steer up the food gradient).
+            let attract = p.food_attraction;
+            let (f, l, r) = if !has_walls && attract == 0.0 {
+                // Default path — bit-for-bit identical to the pre-geography rule.
+                (
+                    self.sense(s, cx, cy, heading, p.sensor_distance),
+                    self.sense(s, cx, cy, heading - p.sensor_angle, p.sensor_distance),
+                    self.sense(s, cx, cy, heading + p.sensor_angle, p.sensor_distance),
+                )
+            } else {
+                (
+                    self.sense_full(s, cx, cy, heading, p.sensor_distance, attract, has_walls),
+                    self.sense_full(
+                        s,
+                        cx,
+                        cy,
+                        heading - p.sensor_angle,
+                        p.sensor_distance,
+                        attract,
+                        has_walls,
+                    ),
+                    self.sense_full(
+                        s,
+                        cx,
+                        cy,
+                        heading + p.sensor_angle,
+                        p.sensor_distance,
+                        attract,
+                        has_walls,
+                    ),
+                )
+            };
 
             // 2. Steer (Jones rule, exactly as in docs/DESIGN.md).
             let new_heading = if f >= l && f >= r {
@@ -788,7 +1381,21 @@ impl Sim {
             nx = nx.rem_euclid(w);
             ny = ny.rem_euclid(h);
 
-            self.heading[i] = new_heading;
+            // With walls present: a move into a wall cell is blocked — the agent
+            // stays put and reorients via ONE RNG draw. The RNG is drawn ONLY when
+            // actually blocked, so an empty mask consumes zero extra draws.
+            if has_walls && self.obstacles[self.idx(nx, ny)] != 0 {
+                nx = cx;
+                ny = cy;
+                let turn = if self.rng.next_f32() < 0.5 {
+                    -p.rotation_angle
+                } else {
+                    p.rotation_angle
+                };
+                self.heading[i] = new_heading + turn;
+            } else {
+                self.heading[i] = new_heading;
+            }
             self.x[i] = nx;
             self.y[i] = ny;
 
@@ -876,12 +1483,46 @@ impl Sim {
 
     /// Sample species `s`'s field at `distance` cells ahead along `angle` from
     /// `(x, y)`, with toroidal wrap. Nearest-sample (cheaper than bilinear; the
-    /// spec allows it).
+    /// spec allows it). This is the pure self-trail sensor; the geography-aware
+    /// variant is [`Sim::sense_full`].
     #[inline(always)]
     fn sense(&self, s: usize, x: f32, y: f32, angle: f32, distance: f32) -> f32 {
         let sx = x + angle.cos() * distance;
         let sy = y + angle.sin() * distance;
         self.field[s][self.idx(sx, sy)]
+    }
+
+    /// Geography-aware sensor: like [`Sim::sense`], but a sample over a wall cell
+    /// reads `0` trail (when `has_walls`), and the food field at the sensor adds
+    /// `attract * food` to the reading (when `attract != 0`) so the agent steers up
+    /// the food gradient. Only called on the obstacle/attraction path; the default
+    /// path uses [`Sim::sense`] for byte-identity.
+    // A flat argument list mirrors the hot-loop call site (no struct churn per agent).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn sense_full(
+        &self,
+        s: usize,
+        x: f32,
+        y: f32,
+        angle: f32,
+        distance: f32,
+        attract: f32,
+        has_walls: bool,
+    ) -> f32 {
+        let sx = x + angle.cos() * distance;
+        let sy = y + angle.sin() * distance;
+        let idx = self.idx(sx, sy);
+        let trail = if has_walls && self.obstacles[idx] != 0 {
+            0.0
+        } else {
+            self.field[s][idx]
+        };
+        if attract != 0.0 {
+            trail + attract * self.food[idx]
+        } else {
+            trail
+        }
     }
 
     /// Map a continuous `(x, y)` to a wrapped, row-major field index.
@@ -912,6 +1553,7 @@ impl Sim {
     fn field_pass(&mut self) {
         let w = self.width;
         let h = self.height;
+        let has_walls = self.obstacle_count != 0;
         for s in 0..SPECIES {
             let center = self.params[s].diffuse_weight;
             let decay = self.params[s].decay;
@@ -920,10 +1562,41 @@ impl Sim {
             let field = &mut self.field[s];
             let scratch = &mut self.field_b;
             let (max, mass) = blur_field_decay(field, scratch, w, h, center, decay);
-            self.field_max[s] = max;
-            self.trail_mass[s] = mass;
+            if has_walls {
+                // Force trail under walls to 0 so the blur can't bleed signal into
+                // (or read trail out of) wall cells, then recompute max/mass over the
+                // masked field. Only runs when obstacles exist — the empty-mask path
+                // keeps the original `(max, mass)` untouched (byte-identity guard).
+                let (mmax, mmass) = mask_walls(field, &self.obstacles);
+                self.field_max[s] = mmax;
+                self.trail_mass[s] = mmass;
+            } else {
+                self.field_max[s] = max;
+                self.trail_mass[s] = mass;
+            }
         }
     }
+}
+
+/// Zero every `field` cell whose `obstacles` cell is a wall, then return the
+/// `(max, total)` of the masked field. Only invoked when obstacles are present.
+/// `obstacles` must be the same length as `field`. Pure and allocation-free.
+#[inline]
+fn mask_walls(field: &mut [f32], obstacles: &[u8]) -> (f32, f64) {
+    let mut max = 0.0f32;
+    let mut total = 0.0f64;
+    for (k, v) in field.iter_mut().enumerate() {
+        if obstacles[k] != 0 {
+            *v = 0.0;
+        } else {
+            let val = *v;
+            if val > max {
+                max = val;
+            }
+            total += val as f64;
+        }
+    }
+    (max, total)
 }
 
 /// Separable 3-tap blur of `field` (horizontal then vertical, toroidal) through
@@ -1400,5 +2073,325 @@ mod tests {
             after_first,
             "reset(seed) + same ticks must reproduce both fields"
         );
+    }
+
+    // --- M6 world-geography tests ---
+
+    /// The `food_attraction == 0` guard: with the default params (attraction off,
+    /// no obstacles, no endpoints), a run that never touches the food/obstacle code
+    /// must reproduce the *baseline* golden checksum exactly. This proves the new
+    /// geography code is fully inert by default — the same proof as
+    /// `tick_is_deterministic`, restated to make the guard explicit.
+    #[test]
+    fn food_attraction_zero_is_inert() {
+        const GOLDEN_SEED: u64 = 0xABCD_1234;
+        const TICKS: usize = 60;
+        const GOLDEN_CHECKSUM: u64 = 0x8de7_8e52_803c_7618;
+
+        let mut sim = Sim::new(128, 128, GOLDEN_SEED);
+        // Defaults: attraction is 0 on both species, no walls, no endpoints.
+        for s in 0..SPECIES {
+            assert_eq!(sim.params(s).food_attraction, 0.0);
+        }
+        assert_eq!(sim.obstacle_count(), 0);
+        assert_eq!(sim.endpoint_count(), 0);
+        for _ in 0..TICKS {
+            sim.tick();
+        }
+        assert_eq!(
+            checksum_all(&sim),
+            GOLDEN_CHECKSUM,
+            "zero-attraction / empty-geometry run drifted from the baseline golden"
+        );
+    }
+
+    /// `load_maze_demo` is deterministic: a fixed seed reproduces identical fields
+    /// across two independent sims and matches a pinned golden value. If the maze
+    /// layout or the rule changes on purpose, run once and paste the new value.
+    #[test]
+    fn maze_demo_is_deterministic() {
+        const SEED: u64 = 0x00C0_FFEE;
+        const TICKS: usize = 80;
+
+        let run = || {
+            let mut sim = Sim::new(128, 128, SEED);
+            sim.load_maze_demo();
+            for _ in 0..TICKS {
+                sim.tick();
+            }
+            checksum_all(&sim)
+        };
+        let a = run();
+        let b = run();
+        assert_eq!(a, b, "two maze runs of the same seed must match");
+
+        const MAZE_GOLDEN_CHECKSUM: u64 = 0x5b28_bd63_4588_0691;
+        assert_eq!(
+            a, MAZE_GOLDEN_CHECKSUM,
+            "maze-demo combined field checksum drifted from golden"
+        );
+    }
+
+    /// `load_maze_demo` builds a sane scenario: walls present, exactly two endpoints,
+    /// food-attraction on for both species, a real population, and the agent/field
+    /// buffers never reallocate (zero-copy preserved across the reset-class call).
+    #[test]
+    fn maze_demo_builds_expected_world() {
+        let mut sim = Sim::new(128, 128, 1);
+        let field_ptrs: [_; SPECIES] = std::array::from_fn(|s| sim.field(s).as_ptr());
+        let food_ptr = sim.food().as_ptr();
+        let obstacle_ptr = sim.obstacles().as_ptr();
+        let cap = sim.capacity();
+
+        sim.load_maze_demo();
+
+        assert!(sim.obstacle_count() > 0, "maze must lay down walls");
+        assert_eq!(sim.endpoint_count(), 2, "maze places two endpoints");
+        for s in 0..SPECIES {
+            assert!(
+                sim.params(s).food_attraction > 0.0,
+                "species {s} must be food-attracted in the maze"
+            );
+        }
+        assert!(sim.agent_count() > 0, "maze must spawn a population");
+        assert_eq!(sim.tick_count(), 0, "maze resets the tick counter");
+
+        // Zero-copy preserved: no buffer reallocated despite rewriting world state.
+        for (s, &ptr) in field_ptrs.iter().enumerate() {
+            assert_eq!(sim.field(s).as_ptr(), ptr, "field {s} reallocated");
+        }
+        assert_eq!(sim.food().as_ptr(), food_ptr, "food reallocated");
+        assert_eq!(
+            sim.obstacles().as_ptr(),
+            obstacle_ptr,
+            "obstacles reallocated"
+        );
+        assert_eq!(sim.capacity(), cap, "agent capacity changed");
+
+        // Mask is binary and counts match.
+        let walls = sim.obstacles().iter().filter(|&&v| v != 0).count();
+        assert_eq!(
+            walls,
+            sim.obstacle_count(),
+            "obstacle_count must match the mask"
+        );
+        assert!(sim.obstacles().iter().all(|&v| v == 0 || v == 1));
+
+        // A maze run stays bounded and never reallocates the trail buffers.
+        for _ in 0..200 {
+            sim.tick();
+        }
+        for (s, &ptr) in field_ptrs.iter().enumerate() {
+            assert_eq!(sim.field(s).as_ptr(), ptr, "field {s} reallocated mid-run");
+        }
+        // Trail never accumulates inside a wall cell (the field pass masks it).
+        for s in 0..SPECIES {
+            for (k, &v) in sim.field(s).iter().enumerate() {
+                if sim.obstacles()[k] != 0 {
+                    assert_eq!(v, 0.0, "trail leaked into a wall cell");
+                }
+            }
+        }
+    }
+
+    /// A reachability scenario hand-built on the trail field: two endpoints in an
+    /// open world start disconnected (no trail between them) and become connected
+    /// once a band of trail bridges them. Asserts `endpoints_connected` goes 1 → 2
+    /// and `network_cost > 0`.
+    #[test]
+    fn reachability_detects_a_growing_bridge() {
+        // Small open world (no obstacles), two endpoints far apart on the same row.
+        let mut sim = Sim::with_capacity(64, 64, 1, 0);
+        // Drop the random food patches so they don't interfere (irrelevant to the
+        // metric, which only reads the trail field, but keeps the test legible).
+        sim.clear_obstacles();
+        sim.add_endpoint(8.0, 32.0, 3.0);
+        sim.add_endpoint(56.0, 32.0, 3.0);
+        assert_eq!(sim.endpoint_count(), 2);
+
+        // No trail yet → endpoint 0 sees only itself; cost is whatever lies under
+        // endpoint 0 (zero, since the field is empty) → 1 connected at most.
+        assert_eq!(sim.endpoints_connected(), 0); // empty field: nothing above thresh
+
+        // Paint a strong trail blob over endpoint 0 only.
+        for x in 5..12 {
+            for y in 29..36 {
+                sim.field[0][y * 64 + x] = 10.0;
+            }
+        }
+        // Endpoint 0 is now in the network; endpoint 1 is not → exactly 1 connected.
+        assert_eq!(sim.endpoints_connected(), 1);
+        assert!(sim.network_cost() > 0);
+
+        // Lay a continuous trail band across the middle row, bridging both endpoints.
+        for x in 0..64 {
+            for y in 30..35 {
+                sim.field[0][y * 64 + x] = 10.0;
+            }
+        }
+        assert_eq!(
+            sim.endpoints_connected(),
+            2,
+            "both endpoints should now be connected by the bridge"
+        );
+        assert!(
+            sim.network_cost() >= 64,
+            "the bridging band should span the world"
+        );
+    }
+
+    /// A wall dividing the world keeps two endpoints on opposite sides disconnected
+    /// even with a strong trail filling the whole field — the flood-fill respects
+    /// walls (it can't cross, and the toroidal wrap is blocked by a full-height wall).
+    #[test]
+    fn reachability_respects_a_dividing_wall() {
+        let mut sim = Sim::with_capacity(64, 64, 1, 0);
+        // Two full-height walls split the torus into two sealed halves (one wall
+        // alone would leave the toroidal wrap-around path open).
+        sim.paint_obstacle_rect(31, 0, 31, 63, true);
+        sim.paint_obstacle_rect(63, 0, 63, 63, true);
+        sim.add_endpoint(16.0, 32.0, 3.0); // left half
+        sim.add_endpoint(47.0, 32.0, 3.0); // right half
+
+        // Fill every open cell with trail — connectivity is purely a wall question.
+        for k in 0..(64 * 64) {
+            sim.field[0][k] = 10.0;
+        }
+        assert_eq!(
+            sim.endpoints_connected(),
+            1,
+            "a sealed wall must keep the far endpoint unreachable"
+        );
+        // The cost equals the open cells in endpoint 0's half (not the whole world).
+        let cost = sim.network_cost();
+        assert!(
+            cost > 0 && cost < 64 * 64,
+            "cost {cost} should be half-world"
+        );
+    }
+
+    /// Painting and clearing obstacles keeps `obstacle_count` exact, and `reset`
+    /// returns the world to fully open with endpoints cleared.
+    #[test]
+    fn obstacle_paint_clear_and_reset() {
+        let mut sim = Sim::new(64, 64, 1);
+        assert_eq!(sim.obstacle_count(), 0);
+        sim.paint_obstacle(32.0, 32.0, 5.0, true);
+        let painted = sim.obstacle_count();
+        assert!(painted > 0);
+        assert_eq!(
+            sim.obstacles().iter().filter(|&&v| v != 0).count(),
+            painted,
+            "count must match the mask after paint"
+        );
+        // Painting the same disk off clears exactly those cells.
+        sim.paint_obstacle(32.0, 32.0, 5.0, false);
+        assert_eq!(sim.obstacle_count(), 0);
+
+        // Endpoints + obstacles are cleared by reset.
+        sim.paint_obstacle(10.0, 10.0, 4.0, true);
+        sim.add_endpoint(20.0, 20.0, 3.0);
+        assert!(sim.obstacle_count() > 0 && sim.endpoint_count() == 1);
+        sim.reset(1);
+        assert_eq!(sim.obstacle_count(), 0, "reset clears obstacles");
+        assert_eq!(sim.endpoint_count(), 0, "reset clears endpoints");
+        assert!(sim.obstacles().iter().all(|&v| v == 0));
+    }
+
+    /// An endpoint pins its food cap high and persistent: the cell under an endpoint
+    /// holds full food and stays fed across ticks (it keeps regrowing).
+    #[test]
+    fn endpoint_pins_persistent_food() {
+        let mut sim = Sim::with_capacity(64, 64, 1, 0);
+        sim.add_endpoint(32.0, 32.0, 4.0);
+        let f0 = sim.food_at(32.0, 32.0);
+        assert!(
+            f0 >= FOOD_PATCH_PEAK - 1e-6,
+            "endpoint cell should start at full food, got {f0}"
+        );
+        // With no agents to eat it, the endpoint cell stays full across ticks.
+        for _ in 0..50 {
+            sim.tick();
+        }
+        let f1 = sim.food_at(32.0, 32.0);
+        assert!(
+            f1 >= FOOD_PATCH_PEAK - 1e-3,
+            "endpoint food drained, got {f1}"
+        );
+        // Accessors read back the endpoint geometry.
+        assert_eq!(sim.endpoint_count(), 1);
+        assert!((sim.endpoint_x(0) - 32.0).abs() < 1e-3);
+        assert!((sim.endpoint_y(0) - 32.0).abs() < 1e-3);
+        assert!((sim.endpoint_radius(0) - 4.0).abs() < 1e-3);
+        // Out-of-range accessors are safe.
+        assert_eq!(sim.endpoint_x(9), 0.0);
+    }
+
+    /// The network threshold knob clamps to `[0, 1]` and round-trips.
+    #[test]
+    fn network_threshold_knob() {
+        let mut sim = Sim::new(32, 32, 1);
+        assert_eq!(sim.network_threshold(), DEFAULT_NETWORK_THRESHOLD);
+        sim.set_network_threshold(0.25);
+        assert_eq!(sim.network_threshold(), 0.25);
+        sim.set_network_threshold(5.0);
+        assert_eq!(sim.network_threshold(), 1.0);
+        sim.set_network_threshold(-1.0);
+        assert_eq!(sim.network_threshold(), 0.0);
+    }
+
+    /// Walls block moves into them: an agent in an open cell, aimed straight at a
+    /// wall, never penetrates it. Built with a single agent (no default population,
+    /// no births to confound the count) on a world split by a full-height wall.
+    #[test]
+    fn walls_block_moves_into_them() {
+        let mut sim = Sim::with_capacity(64, 64, 5, 16);
+        // Strip the default population: this test wants exactly one tracked agent.
+        sim.x.clear();
+        sim.y.clear();
+        sim.heading.clear();
+        sim.energy.clear();
+        sim.species.clear();
+        sim.clear_obstacles();
+        // A full-height wall at column 32. Make the ecology benign so the lone agent
+        // neither starves nor reproduces during the test.
+        sim.paint_obstacle_rect(30, 0, 34, 63, true);
+        for s in 0..SPECIES {
+            let mut e = sim.ecology(s);
+            e.metabolism = 0.0;
+            e.repro_threshold = 1e9;
+            sim.set_ecology(s, e);
+        }
+        // Place one agent just left of the wall, heading straight at it (+x).
+        sim.x.push(28.0);
+        sim.y.push(32.0);
+        sim.heading.push(0.0);
+        sim.energy.push(1.0);
+        sim.species.push(0);
+        for _ in 0..200 {
+            sim.tick();
+            assert_eq!(sim.agent_count(), 1, "the lone agent must persist");
+            let idx = sim.idx(sim.agent_x(0), sim.agent_y(0));
+            assert_eq!(sim.obstacles()[idx], 0, "agent penetrated the wall");
+        }
+    }
+
+    /// The load-bearing guarantee: the maze demo spawns only in open space, so no
+    /// agent is ever inside a wall across a full run (covers both spawn and move).
+    #[test]
+    fn maze_agents_never_enter_walls() {
+        let mut maze = Sim::new(128, 128, 9);
+        maze.load_maze_demo();
+        for _ in 0..250 {
+            maze.tick();
+            for i in 0..maze.agent_count() {
+                let idx = maze.idx(maze.agent_x(i), maze.agent_y(i));
+                assert_eq!(
+                    maze.obstacles()[idx],
+                    0,
+                    "maze agent {i} stands inside a wall cell (spawn or move bug)"
+                );
+            }
+        }
     }
 }

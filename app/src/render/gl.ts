@@ -70,6 +70,42 @@ export function uploadField(
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RED, gl.FLOAT, data);
 }
 
+/**
+ * Immutable-storage single-channel `u8` texture for the obstacle (wall) mask.
+ * Stored as `R8` — a *normalized* format, so a mask value of `1` samples back as
+ * `1/255 ≈ 0.0039`; test `> 0.0` in the shader rather than `== 1.0`. Always
+ * NEAREST-filtered so walls have crisp edges. Update each frame with
+ * {@link uploadObstacle}.
+ */
+export function createObstacleTexture(
+  gl: WebGL2RenderingContext,
+  width: number,
+  height: number,
+): WebGLTexture {
+  const tex = gl.createTexture()!;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R8, width, height);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+
+export function uploadObstacle(
+  gl: WebGL2RenderingContext,
+  tex: WebGLTexture,
+  width: number,
+  height: number,
+  data: Uint8Array,
+): void {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  // R8/UNSIGNED_BYTE rows aren't 4-byte aligned; force tight packing.
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RED, gl.UNSIGNED_BYTE, data);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+}
+
 /** A framebuffer + RGBA16F texture pair used as a bloom ping-pong target. */
 export interface BloomFBO {
   fbo: WebGLFramebuffer;

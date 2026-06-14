@@ -19,7 +19,9 @@ import {
   createBloomFBO,
   createFieldTexture,
   createGL,
+  createObstacleTexture,
   uploadField,
+  uploadObstacle,
 } from "./render/gl";
 import { applySharedState, decodeHash, encodeState, type SimParamObjects } from "./urlstate";
 import init, { Sim } from "./wasm/petri_wasm.js";
@@ -51,6 +53,7 @@ in vec2 v_uv;
 uniform sampler2D u_field0;   // species 0 trail
 uniform sampler2D u_field1;   // species 1 trail
 uniform sampler2D u_food;
+uniform sampler2D u_obstacle; // wall mask (R8: 0 = open, ~0.0039 = wall)
 uniform float u_gain0;
 uniform float u_gain1;
 uniform float u_food_gain;
@@ -96,6 +99,16 @@ vec3 foodPalette(float t) {
 }
 
 void main() {
+  // --- Walls ---
+  // R8 is normalized, so a wall (stored as 1) reads back as ~1/255; open cells
+  // are exactly 0. A wall is a dim desaturated slate, kept well under the bloom
+  // bright-pass threshold (~0.4) so it never glows. Skip trail + food there.
+  bool isWall = texture(u_obstacle, v_uv).r > 0.0;
+  if (isWall) {
+    o = vec4(vec3(0.07, 0.09, 0.12), 1.0);
+    return;
+  }
+
   // --- Species 0 (cyan) ---
   float raw0 = texture(u_field0, v_uv).r;
   float t0 = pow(clamp(raw0 * u_gain0, 0.0, 1.0), 0.45);
@@ -190,6 +203,40 @@ void main() {
 }`;
 
 // ---------------------------------------------------------------------------
+// Endpoint markers — one glowing ring per endpoint, drawn additively over the
+// final composite so they mark sources/sinks at a glance. Each endpoint is one
+// gl.POINTS vertex; the vertex shader looks up its centre/size from a uniform
+// array (sim coords → clip space with the same Y-flip the spawn handler uses).
+// The fragment shader draws a soft ring within the point sprite.
+// ---------------------------------------------------------------------------
+const MAX_MARKERS = 64;
+
+const VERT_MARKER = `#version 300 es
+precision highp float;
+uniform vec2 u_centers[${MAX_MARKERS}];  // clip-space centres
+uniform float u_sizes[${MAX_MARKERS}];   // point sizes (px)
+void main() {
+  gl_Position = vec4(u_centers[gl_VertexID], 0.0, 1.0);
+  gl_PointSize = u_sizes[gl_VertexID];
+}`;
+
+const FRAG_MARKER = `#version 300 es
+precision highp float;
+uniform vec3 u_color;
+out vec4 o;
+void main() {
+  // gl_PointCoord is [0,1] over the sprite; centre the radial coordinate.
+  vec2 p = gl_PointCoord * 2.0 - 1.0;
+  float r = length(p);
+  // A bright ring near the rim, fading to transparent inside and outside.
+  float ring = smoothstep(0.55, 0.78, r) * (1.0 - smoothstep(0.92, 1.0, r));
+  float core = (1.0 - smoothstep(0.0, 0.30, r)) * 0.5; // soft centre dot
+  float a = clamp(ring + core, 0.0, 1.0);
+  if (a <= 0.001) discard;
+  o = vec4(u_color * a, a);
+}`;
+
+// ---------------------------------------------------------------------------
 // Sim dimensions
 // ---------------------------------------------------------------------------
 const WIDTH = 256;
@@ -226,17 +273,23 @@ function makeFoodView(wasm: { memory: WebAssembly.Memory }, sim: Sim): Float32Ar
   return new Float32Array(wasm.memory.buffer, sim.food_ptr(), sim.food_len());
 }
 
-// Re-fetch all zero-copy views and return them.
+function makeObstacleView(wasm: { memory: WebAssembly.Memory }, sim: Sim): Uint8Array {
+  return new Uint8Array(wasm.memory.buffer, sim.obstacle_ptr(), sim.obstacle_len());
+}
+
+// Re-fetch all zero-copy views and return them. Call after every reset-class
+// op (reset / spawn / load_maze_demo / add_endpoint / clear_endpoints): WASM
+// memory may grow and detach every view, so all of them must be rebuilt.
 function refreshViews(
   wasm: { memory: WebAssembly.Memory },
   sim: Sim,
-): { trails: Float32Array[]; food: Float32Array } {
+): { trails: Float32Array[]; food: Float32Array; obstacle: Uint8Array } {
   const count = sim.species_count();
   const trails: Float32Array[] = [];
   for (let s = 0; s < count; s++) {
     trails.push(makeTrailView(wasm, sim, s));
   }
-  return { trails, food: makeFoodView(wasm, sim) };
+  return { trails, food: makeFoodView(wasm, sim), obstacle: makeObstacleView(wasm, sim) };
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +372,31 @@ interface SpawnState {
 }
 
 // ---------------------------------------------------------------------------
+// Geometry state — drives the paint-tool dispatch in the canvas pointer handler.
+// ---------------------------------------------------------------------------
+type GeometryTool = "spawn" | "paint-wall" | "erase-wall" | "place-endpoint";
+
+interface GeometryState {
+  tool: GeometryTool;
+  brushRadius: number; // wall brush radius (cells)
+  endpointRadius: number; // endpoint well radius (cells)
+}
+
+// ---------------------------------------------------------------------------
+// Chemotaxis state — per-species food-attraction (chemotaxis) weight.
+// ---------------------------------------------------------------------------
+interface ChemotaxisParams {
+  food_attraction: number;
+}
+
+// ---------------------------------------------------------------------------
+// Network (reachability metric) state — the threshold knob.
+// ---------------------------------------------------------------------------
+interface NetworkParams {
+  network_threshold: number;
+}
+
+// ---------------------------------------------------------------------------
 // Transport state
 // ---------------------------------------------------------------------------
 interface Transport {
@@ -338,6 +416,7 @@ function addSpeciesFolder(
   species: number,
   params: SimParams,
   ecology: EcologyParams,
+  chemotaxis: ChemotaxisParams,
 ): void {
   const folder = pane.addFolder({ title: label, expanded: false });
 
@@ -400,6 +479,16 @@ function addSpeciesFolder(
   folder
     .addBinding(ecology, "death_return", { label: "death return", min: 0, max: 1, step: 0.05 })
     .on("change", () => applyEcologyParams(sim, species, ecology));
+
+  // Chemotaxis — steers agents up the food gradient toward endpoints.
+  folder
+    .addBinding(chemotaxis, "food_attraction", {
+      label: "food attraction",
+      min: 0,
+      max: 10,
+      step: 0.1,
+    })
+    .on("change", () => sim.set_food_attraction(species, chemotaxis.food_attraction));
 }
 
 // ---------------------------------------------------------------------------
@@ -409,9 +498,14 @@ function buildPane(
   sim: Sim,
   allParams: SimParams[],
   allEcology: EcologyParams[],
+  allChemotaxis: ChemotaxisParams[],
+  network: NetworkParams,
   spawn: SpawnState,
+  geometry: GeometryState,
   transport: Transport,
   onReset: () => void,
+  onLoadMaze: () => void,
+  onClearGeometry: () => void,
   seedRef: { value: number },
   metricsBuf: MetricsBuffer,
   paneRef: { pane: Pane | null },
@@ -456,8 +550,51 @@ function buildPane(
   // --- Per-species parameter folders (collapsed by default) ----------------
   const speciesLabels = ["Species 0 · cyan", "Species 1 · magenta"];
   for (let s = 0; s < sim.species_count(); s++) {
-    addSpeciesFolder(pane, speciesLabels[s], sim, s, allParams[s], allEcology[s]);
+    addSpeciesFolder(pane, speciesLabels[s], sim, s, allParams[s], allEcology[s], allChemotaxis[s]);
   }
+
+  // --- Geometry (walls + endpoints) ----------------------------------------
+  const geomFolder = pane.addFolder({ title: "Geometry (click canvas)", expanded: false });
+
+  geomFolder.addBinding(geometry, "tool", {
+    label: "tool",
+    view: "list",
+    options: [
+      { text: "spawn", value: "spawn" },
+      { text: "paint wall", value: "paint-wall" },
+      { text: "erase wall", value: "erase-wall" },
+      { text: "place endpoint", value: "place-endpoint" },
+    ],
+  });
+
+  geomFolder.addBinding(geometry, "brushRadius", {
+    label: "brush (cells)",
+    min: 1,
+    max: 24,
+    step: 1,
+  });
+
+  geomFolder.addBinding(geometry, "endpointRadius", {
+    label: "endpoint (cells)",
+    min: 2,
+    max: 24,
+    step: 1,
+  });
+
+  geomFolder.addButton({ title: "Load maze demo" }).on("click", onLoadMaze);
+  geomFolder.addButton({ title: "Clear geometry" }).on("click", onClearGeometry);
+
+  // --- Network (reachability metric) ---------------------------------------
+  const networkFolder = pane.addFolder({ title: "Network", expanded: false });
+
+  networkFolder
+    .addBinding(network, "network_threshold", {
+      label: "threshold",
+      min: 0,
+      max: 1,
+      step: 0.005,
+    })
+    .on("change", () => sim.set_network_threshold(network.network_threshold));
 
   // --- Spawn ---------------------------------------------------------------
   const spawnFolder = pane.addFolder({ title: "Spawn (click canvas)", expanded: false });
@@ -509,25 +646,73 @@ function buildPane(
 }
 
 // ---------------------------------------------------------------------------
-// Click-to-spawn canvas handler
+// Canvas pointer handler — dispatches on the active Geometry tool.
+//   spawn          → sim.spawn (reset-class → re-fetch views)
+//   paint/erase    → sim.paint_obstacle (in-place, supports click-drag)
+//   place-endpoint → sim.add_endpoint (reset-class → re-fetch views)
+// All tools share the same pointer→sim-coord mapping with the Y-flip.
 // ---------------------------------------------------------------------------
-function attachSpawnHandler(
+function attachCanvasHandler(
   canvas: HTMLCanvasElement,
   sim: Sim,
   spawn: SpawnState,
-  onSpawn: () => void,
+  geometry: GeometryState,
+  onRefetch: () => void,
 ): void {
-  canvas.addEventListener("pointerdown", (e: PointerEvent) => {
+  // Map a pointer event to sim cell coords (Y-flipped to match the renderer).
+  function toSim(e: PointerEvent): { sx: number; sy: number } {
     const rect = canvas.getBoundingClientRect();
     const u = (e.clientX - rect.left) / rect.width;
     const v = (e.clientY - rect.top) / rect.height;
     // The fullscreen triangle maps uv(0,0) to the bottom-left of clip space,
     // so field row 0 renders at the bottom of the screen. Flip V to correct.
-    const sx = u * sim.width();
-    const sy = (1 - v) * sim.height();
-    sim.spawn(sx, sy, spawn.count, spawn.pattern, spawn.species);
-    onSpawn();
+    return { sx: u * sim.width(), sy: (1 - v) * sim.height() };
+  }
+
+  let painting = false;
+
+  function apply(e: PointerEvent, isDrag: boolean): void {
+    const { sx, sy } = toSim(e);
+    switch (geometry.tool) {
+      case "spawn":
+        if (isDrag) return; // spawn only on the initial press
+        sim.spawn(sx, sy, spawn.count, spawn.pattern, spawn.species);
+        onRefetch(); // reset-class
+        break;
+      case "paint-wall":
+        sim.paint_obstacle(sx, sy, geometry.brushRadius, true); // in-place
+        break;
+      case "erase-wall":
+        sim.paint_obstacle(sx, sy, geometry.brushRadius, false); // in-place
+        break;
+      case "place-endpoint":
+        if (isDrag) return; // one endpoint per press
+        sim.add_endpoint(sx, sy, geometry.endpointRadius);
+        onRefetch(); // reset-class
+        break;
+    }
+  }
+
+  canvas.addEventListener("pointerdown", (e: PointerEvent) => {
+    painting = true;
+    canvas.setPointerCapture(e.pointerId);
+    apply(e, false);
   });
+
+  canvas.addEventListener("pointermove", (e: PointerEvent) => {
+    if (!painting) return;
+    // Only the wall tools paint continuously while dragging.
+    if (geometry.tool === "paint-wall" || geometry.tool === "erase-wall") {
+      apply(e, true);
+    }
+  });
+
+  const endPaint = (e: PointerEvent): void => {
+    painting = false;
+    if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+  };
+  canvas.addEventListener("pointerup", endPaint);
+  canvas.addEventListener("pointercancel", endPaint);
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +768,7 @@ async function main(): Promise<void> {
   const progBright = compileProgram(gl, VERT, FRAG_BRIGHT);
   const progBlur = compileProgram(gl, VERT, FRAG_BLUR);
   const progComposite = compileProgram(gl, VERT, FRAG_COMPOSITE);
+  const progMarker = compileProgram(gl, VERT_MARKER, FRAG_MARKER);
 
   // ---------------------------------------------------------------------------
   // Trail textures — one per species (R32F, updated each frame)
@@ -597,6 +783,11 @@ async function main(): Promise<void> {
   // Food field texture (R32F, updated each frame)
   // ---------------------------------------------------------------------------
   const foodTex = createFieldTexture(gl, WIDTH, HEIGHT);
+
+  // ---------------------------------------------------------------------------
+  // Obstacle (wall) mask texture (R8, updated each frame)
+  // ---------------------------------------------------------------------------
+  const obstacleTex = createObstacleTexture(gl, WIDTH, HEIGHT);
 
   // ---------------------------------------------------------------------------
   // Off-screen FBOs — reallocated on resize
@@ -619,6 +810,7 @@ async function main(): Promise<void> {
   const ulTonemap_field0 = gl.getUniformLocation(progTonemap, "u_field0");
   const ulTonemap_field1 = gl.getUniformLocation(progTonemap, "u_field1");
   const ulTonemap_food = gl.getUniformLocation(progTonemap, "u_food");
+  const ulTonemap_obstacle = gl.getUniformLocation(progTonemap, "u_obstacle");
   const ulTonemap_gain0 = gl.getUniformLocation(progTonemap, "u_gain0");
   const ulTonemap_gain1 = gl.getUniformLocation(progTonemap, "u_gain1");
   const ulTonemap_foodGain = gl.getUniformLocation(progTonemap, "u_food_gain");
@@ -630,6 +822,10 @@ async function main(): Promise<void> {
   const ulComp_base = gl.getUniformLocation(progComposite, "u_base");
   const ulComp_bloom = gl.getUniformLocation(progComposite, "u_bloom");
   const ulComp_strength = gl.getUniformLocation(progComposite, "u_bloom_strength");
+  // markers
+  const ulMarker_centers = gl.getUniformLocation(progMarker, "u_centers");
+  const ulMarker_sizes = gl.getUniformLocation(progMarker, "u_sizes");
+  const ulMarker_color = gl.getUniformLocation(progMarker, "u_color");
 
   // ---------------------------------------------------------------------------
   // Per-species EMA references for auto-exposure + shared food normalization.
@@ -644,12 +840,16 @@ async function main(): Promise<void> {
   // ---------------------------------------------------------------------------
   const allParams: SimParams[] = [];
   const allEcology: EcologyParams[] = [];
+  const allChemotaxis: ChemotaxisParams[] = [];
   for (let s = 0; s < speciesCount; s++) {
     allParams.push(readSimParams(sim, s));
     allEcology.push(readEcologyParams(sim, s));
+    allChemotaxis.push({ food_attraction: sim.food_attraction(s) });
   }
 
+  const network: NetworkParams = { network_threshold: sim.network_threshold() };
   const spawn: SpawnState = { count: 500, pattern: 1, species: 0 };
+  const geometry: GeometryState = { tool: "spawn", brushRadius: 6, endpointRadius: 8 };
   const transport: Transport = { paused: false, speed: 1, stepOnce: false };
   const seedRef = { value: initialSeed };
 
@@ -668,6 +868,9 @@ async function main(): Promise<void> {
       mass: [sim.trail_mass(0), sim.trail_mass(1)],
       foodTotal: sim.food_total(),
       foodCoverage: sim.food_coverage(),
+      connected: sim.endpoints_connected(),
+      endpointCount: sim.endpoint_count(),
+      networkCost: sim.network_cost(),
     };
     metricsBuf.push(s);
     latestSample = s;
@@ -691,7 +894,49 @@ async function main(): Promise<void> {
     latestSample = null;
   }
 
-  buildPane(sim, allParams, allEcology, spawn, transport, doReset, seedRef, metricsBuf, paneRef);
+  // Load the built-in maze scenario — reset-class (rewrites obstacles,
+  // endpoints, food, population), so re-fetch all views. Sync the param panel
+  // since food-attraction is turned on by the demo.
+  function doLoadMaze(): void {
+    sim.load_maze_demo();
+    views = refreshViews(wasm, sim);
+    for (let s = 0; s < speciesCount; s++) {
+      emaRefs[s] = 1.0;
+      allChemotaxis[s].food_attraction = sim.food_attraction(s);
+    }
+    network.network_threshold = sim.network_threshold();
+    emaFoodRef = 1.0;
+    metricsBuf.clear();
+    metricsBuf.foodCeiling = sim.food_total();
+    latestSample = null;
+    paneRef.pane?.refresh();
+  }
+
+  // Clear walls + endpoints. clear_obstacles is in-place; clear_endpoints is
+  // reset-class (recomputes food caps), so re-fetch all views afterward.
+  function doClearGeometry(): void {
+    sim.clear_obstacles();
+    sim.clear_endpoints();
+    views = refreshViews(wasm, sim);
+    metricsBuf.foodCeiling = sim.food_total();
+  }
+
+  buildPane(
+    sim,
+    allParams,
+    allEcology,
+    allChemotaxis,
+    network,
+    spawn,
+    geometry,
+    transport,
+    doReset,
+    doLoadMaze,
+    doClearGeometry,
+    seedRef,
+    metricsBuf,
+    paneRef,
+  );
 
   // ---------------------------------------------------------------------------
   // Apply shared state from URL hash (after pane is built so we can refresh it)
@@ -704,7 +949,7 @@ async function main(): Promise<void> {
     paneRef.pane?.refresh();
   }
 
-  attachSpawnHandler(canvas, sim, spawn, () => {
+  attachCanvasHandler(canvas, sim, spawn, geometry, () => {
     views = refreshViews(wasm, sim);
   });
 
@@ -736,11 +981,13 @@ async function main(): Promise<void> {
     // Sample metrics once per frame (x-axis is tick_count, reproducible).
     recordSample();
 
-    // Upload all trail textures and food texture after all ticks this frame.
+    // Upload all trail textures, food texture, and obstacle mask after all
+    // ticks this frame.
     for (let s = 0; s < speciesCount; s++) {
       uploadField(gl, trailTexs[s], WIDTH, HEIGHT, views.trails[s]);
     }
     uploadField(gl, foodTex, WIDTH, HEIGHT, views.food);
+    uploadObstacle(gl, obstacleTex, WIDTH, HEIGHT, views.obstacle);
 
     // Per-species EMA-stabilised auto-exposure — prevents one species from
     // visually dominating the other when their trail maxima diverge.
@@ -776,6 +1023,10 @@ async function main(): Promise<void> {
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, foodTex);
     gl.uniform1i(ulTonemap_food, 2);
+
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, obstacleTex);
+    gl.uniform1i(ulTonemap_obstacle, 3);
 
     gl.uniform1f(ulTonemap_gain0, gains[0]);
     gl.uniform1f(ulTonemap_gain1, gains[1]);
@@ -844,6 +1095,38 @@ async function main(): Promise<void> {
     gl.uniform1i(ulComp_bloom, 1);
     gl.uniform1f(ulComp_strength, BLOOM_STRENGTH);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // ------------------------------------------------------------------
+    // Pass 5 — Endpoint markers: additive glowing rings over the composite.
+    // sim coords → clip space matches the spawn handler's Y convention
+    // (field row 0 is at the bottom, so sim y maps straight to clip y).
+    // ------------------------------------------------------------------
+    const epCount = Math.min(sim.endpoint_count(), MAX_MARKERS);
+    if (epCount > 0) {
+      const centers = new Float32Array(MAX_MARKERS * 2);
+      const sizes = new Float32Array(MAX_MARKERS);
+      // Diameter scale: cells → device px along x (canvas pixels per cell × 2
+      // for the sprite to comfortably enclose the well, with a sane minimum).
+      const pxPerCell = canvas.width / sim.width();
+      for (let i = 0; i < epCount; i++) {
+        const ex = sim.endpoint_x(i);
+        const ey = sim.endpoint_y(i);
+        const er = sim.endpoint_radius(i);
+        centers[i * 2] = (ex / sim.width()) * 2.0 - 1.0;
+        centers[i * 2 + 1] = (ey / sim.height()) * 2.0 - 1.0;
+        sizes[i] = Math.max(14.0, er * pxPerCell * 2.4);
+      }
+
+      gl.useProgram(progMarker);
+      gl.uniform2fv(ulMarker_centers, centers);
+      gl.uniform1fv(ulMarker_sizes, sizes);
+      gl.uniform3f(ulMarker_color, 1.0, 0.78, 0.32); // warm amber rings
+
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE); // additive glow
+      gl.drawArrays(gl.POINTS, 0, epCount);
+      gl.disable(gl.BLEND);
+    }
 
     // ------------------------------------------------------------------
     // Sparklines overlay — drawn on the 2D canvas, separate from WebGL
