@@ -1,0 +1,12 @@
+[package]
+name = "petri-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure, native-testable simulation core for Petri Polis (Physarum + ecology)."
+
+[lib]
+
+[dependencies]
+# Intentionally dependency-free: the PRNG and sim are hand-rolled so behavior is
+# deterministic and stable across versions/platforms. See docs/DESIGN.md (D4).

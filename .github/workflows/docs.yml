@@ -1,0 +1,56 @@
+name: Docs
+
+# Build the Rust API docs and publish them to GitHub Pages.
+# (Designed to also host the planned mdBook guide later — add a build step and
+# place its output alongside the API docs under the uploaded directory.)
+#
+# One-time setup: in the repo, Settings → Pages → Build and deployment →
+# Source = "GitHub Actions". The configure-pages step below also attempts to
+# enable it automatically.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; don't cancel an in-progress one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build API docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc
+        run: cargo doc --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - name: Redirect site root → petri_core docs
+        run: echo '<meta http-equiv="refresh" content="0;url=petri_core/index.html">' > target/doc/index.html
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,13 @@
+# Rust
+/target
+
+# Node / Vite
+**/node_modules
+/app/dist
+
+# Generated wasm-pack output (rebuilt from crates/petri-wasm)
+/app/src/wasm
+
+# Misc
+*.log
+.DS_Store
