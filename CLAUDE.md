@@ -6,13 +6,14 @@ bioluminescent networks. Fast **Rust→WASM** simulation, **WebGL2** rendering, 
 site. No backend.
 
 > **Read `docs/DESIGN.md` for the architecture and the decisions log, `docs/ROADMAP.md` for
-> the milestone arc, and `docs/BACKLOG.md` for the next concrete task.** `docs/initial-spec.md`
-> is historical — superseded by DESIGN.md.
+> the milestone arc, and `docs/BACKLOG.md` for the next concrete task.** The user-facing guide
+> (concepts & algorithms) is the mdBook in `docs/guide/`. `docs/initial-spec.md` is historical —
+> superseded by DESIGN.md.
 
 ## Build / run / test
 
-> Frontend uses **bun** (not npm). Verified working as of M1 (Rust 1.95, wasm-pack 0.15,
-> wasm-bindgen 0.2.125, bun 1.3, Vite 8, TypeScript 6).
+> Frontend uses **bun** (not npm). Verified working with these versions (Rust 1.95, wasm-pack
+> 0.15, wasm-bindgen 0.2.125, bun 1.3, Vite 8, TypeScript 6, mdBook 0.4).
 
 ```bash
 # Build the Rust sim → WASM into app/src/wasm/
@@ -24,6 +25,10 @@ bun run dev
 
 # Native Rust tests (sim core is testable WITHOUT the browser)
 cargo test -p petri-core
+
+# Build/serve the guide (mdBook) — concepts & algorithms
+mdbook serve docs/guide       # live at http://localhost:3000
+mdbook build docs/guide       # one-off → docs/guide/book/
 
 # Production build
 bash scripts/build-wasm.sh --release && (cd app && bun run build)
@@ -44,6 +49,11 @@ Rust→wasm rebuilds only matter when you change *rules/structure*. Tuning **run
   inside the per-frame loop.
 - **TS render:** the renderer is the product. Field → R32F texture → colormap (bioluminescent
   LUT) → bloom → present. Keep passes small and readable; beauty before features.
+- **Docs describe the present, not the process:** reference docs (`DESIGN.md`), code comments,
+  and runtime/UI strings describe the system **as it is now** — no milestone labels (`M1`,
+  `M2`), task IDs, "deferred to…", "(later)", or historical references ("superseded by",
+  "initially…", "used to"). Milestone/task sequencing lives only in `ROADMAP.md` and
+  `BACKLOG.md`; those two files are the only sanctioned home for it.
 
 ## Guardrails — the cut-list (do NOT reintroduce without an explicit decision)
 
@@ -79,5 +89,10 @@ crates/petri-wasm   wasm-bindgen Sim wrapper (zero-copy field handle)
 app/                Vite + TS + WebGL2 renderer + Tweakpane UI
 scripts/            build-wasm.sh
 docs/               DESIGN.md (arch + decisions), ROADMAP.md, BACKLOG.md, initial-spec.md (historical)
+docs/guide/         the mdBook guide (concepts & algorithms) — published to Pages
 .claude/agents/     petri-rust.md, petri-render.md
+.github/workflows/  ci.yml (fmt/clippy/test + wasm/lint/build), docs.yml (Pages: app + guide + API)
 ```
+
+Pushing to `main` publishes the live toy, the guide, and the API docs to GitHub Pages via
+`docs.yml`. The Pages site is `/` (landing) · `/app/` (toy) · `/guide/` (book) · `/api/` (rustdoc).

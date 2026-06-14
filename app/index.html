@@ -12,11 +12,29 @@
         font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
         color: #7fe9d9; opacity: 0.65; pointer-events: none; user-select: none;
       }
+      #sparklines {
+        position: fixed; bottom: 12px; left: 10px;
+        pointer-events: none; user-select: none;
+        image-rendering: pixelated;
+      }
+      #inspector {
+        display: none;
+        position: fixed; bottom: 12px; right: 10px;
+        font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #a8ddd8; opacity: 0.82;
+        background: rgba(4,8,16,0.72);
+        border-radius: 5px;
+        padding: 6px 10px;
+        white-space: pre;
+        pointer-events: none; user-select: none;
+      }
     </style>
   </head>
   <body>
     <canvas id="c"></canvas>
     <div id="hud">starting…</div>
+    <canvas id="sparklines" width="240" height="168"></canvas>
+    <div id="inspector"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
