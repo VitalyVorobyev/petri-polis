@@ -1,0 +1,20 @@
+[book]
+title = "The Petri Polis Guide"
+authors = ["Vitaly Vorobyev"]
+description = "The concepts and algorithms behind Petri Polis — a Physarum trail simulation in Rust + WebAssembly + WebGL2."
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/VitalyVorobyev/petri-polis"
+edit-url-template = "https://github.com/VitalyVorobyev/petri-polis/edit/main/docs/guide/{path}"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 0

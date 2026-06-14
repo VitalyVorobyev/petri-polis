@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Petri Polis</title>
+    <meta
+      name="description"
+      content="A bioluminescent toy for watching complex patterns grow out of a few simple rules — the Physarum slime-mold algorithm in Rust, WebAssembly, and WebGL2."
+    />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #04070a;
+        --cyan: #36e0d6;
+        --magenta: #e85fd0;
+        --ink: #cfe9ec;
+        --muted: #7f9aa0;
+        --card: #0b1318;
+        --edge: #16242b;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; }
+      body {
+        background:
+          radial-gradient(1100px 700px at 18% -8%, rgba(54, 224, 214, 0.13), transparent 60%),
+          radial-gradient(1000px 700px at 100% 110%, rgba(232, 95, 208, 0.12), transparent 60%),
+          var(--bg);
+        color: var(--ink);
+        font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 6vh 24px;
+      }
+      main { width: 100%; max-width: 760px; }
+      .tag {
+        letter-spacing: 0.28em;
+        text-transform: uppercase;
+        font-size: 12px;
+        color: var(--muted);
+        margin: 0 0 14px;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: clamp(40px, 9vw, 76px);
+        font-weight: 700;
+        line-height: 1.02;
+        background: linear-gradient(96deg, var(--cyan), #eef6f7 52%, var(--magenta));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .lede { margin: 0 0 36px; max-width: 56ch; color: var(--ink); }
+      .lede b { color: #eaf7f8; }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 16px;
+      }
+      a.card {
+        display: block;
+        padding: 22px;
+        border: 1px solid var(--edge);
+        border-radius: 14px;
+        background: linear-gradient(180deg, var(--card), #070d11);
+        text-decoration: none;
+        color: var(--ink);
+        transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+      }
+      a.card:hover {
+        transform: translateY(-3px);
+        border-color: rgba(54, 224, 214, 0.55);
+        box-shadow: 0 10px 40px rgba(54, 224, 214, 0.12);
+      }
+      a.card .h { font-size: 19px; font-weight: 650; margin: 0 0 6px; }
+      a.card.play .h { color: var(--cyan); }
+      a.card.guide .h { color: #d6eef0; }
+      a.card.api .h { color: var(--magenta); }
+      a.card p { margin: 0; font-size: 14px; color: var(--muted); }
+      footer { margin-top: 40px; font-size: 13px; color: var(--muted); }
+      footer a { color: var(--cyan); text-decoration: none; }
+      footer a:hover { text-decoration: underline; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="tag">Rust · WebAssembly · WebGL2</p>
+      <h1>Petri Polis</h1>
+      <p class="lede">
+        A bioluminescent toy for watching <b>complex patterns grow out of a few simple rules</b>.
+        Thousands of agents drop glowing trails, sense the glow ahead, and steer toward it — and with no
+        central plan they weave themselves into living, branching networks. Two species compete over a
+        shared, regrowing food field, so the world also breathes in boom/bust cycles.
+      </p>
+      <nav class="grid">
+        <a class="card play" href="./app/">
+          <p class="h">▶ Play</p>
+          <p>Run the toy in your browser. Tune every rule live, spawn agents, and share a run by URL.</p>
+        </a>
+        <a class="card guide" href="./guide/">
+          <p class="h">The guide</p>
+          <p>A book on the concepts and algorithms: the Physarum rule, the ecology, two-species coexistence, determinism.</p>
+        </a>
+        <a class="card api" href="./api/">
+          <p class="h">API docs</p>
+          <p>Generated <code>cargo doc</code> for the <code>petri-core</code> and <code>petri-wasm</code> crates.</p>
+        </a>
+      </nav>
+      <footer>
+        Source on <a href="https://github.com/VitalyVorobyev/petri-polis">GitHub</a> · MIT licensed
+      </footer>
+    </main>
+  </body>
+</html>

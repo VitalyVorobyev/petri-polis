@@ -8,6 +8,9 @@
 # Generated wasm-pack output (rebuilt from crates/petri-wasm)
 /app/src/wasm
 
+# Generated mdBook output (rebuilt from docs/guide/src)
+/docs/guide/book
+
 # Misc
 *.log
 .DS_Store

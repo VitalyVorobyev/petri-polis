@@ -1,8 +1,11 @@
 name: Docs
 
-# Build the Rust API docs and publish them to GitHub Pages.
-# (Designed to also host the planned mdBook guide later — add a build step and
-# place its output alongside the API docs under the uploaded directory.)
+# Build the live toy, the mdBook guide, and the Rust API docs, then publish all
+# three to GitHub Pages as one site:
+#   /        landing page (.github/pages/index.html)
+#   /app/    the live WebGL toy   (Vite build, base=/petri-polis/app/)
+#   /guide/  the mdBook guide     (mdbook build docs/guide)
+#   /api/    rustdoc              (cargo doc --no-deps --workspace)
 #
 # One-time setup: in the repo, Settings → Pages → Build and deployment →
 # Source = "GitHub Actions". The configure-pages step below also attempts to
@@ -25,24 +28,60 @@ concurrency:
 
 jobs:
   build:
-    name: Build API docs
+    name: Build site (app + guide + API)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: cargo doc
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack,mdbook
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build API docs (rustdoc)
         run: cargo doc --no-deps --workspace
         env:
           RUSTDOCFLAGS: "-D warnings"
-      - name: Redirect site root → petri_core docs
-        run: echo '<meta http-equiv="refresh" content="0;url=petri_core/index.html">' > target/doc/index.html
+
+      - name: Build the guide (mdBook)
+        run: mdbook build docs/guide
+
+      - name: Build wasm (release)
+        run: bash scripts/build-wasm.sh --release
+
+      - name: Install frontend deps
+        run: bun install --frozen-lockfile
+        working-directory: app
+
+      - name: Build the live toy (Pages base path)
+        run: bun run build:pages
+        working-directory: app
+
+      - name: Assemble the Pages site
+        run: |
+          set -euo pipefail
+          rm -rf public
+          mkdir -p public public/app public/guide public/api
+          cp .github/pages/index.html public/index.html
+          cp -r app/dist/.        public/app/
+          cp -r docs/guide/book/. public/guide/
+          cp -r target/doc/.      public/api/
+          # rustdoc has no workspace-level index → redirect /api/ to the core crate.
+          echo '<meta http-equiv="refresh" content="0;url=petri_core/index.html">' > public/api/index.html
+          # Don't let Jekyll mangle rustdoc's _-prefixed asset folders.
+          touch public/.nojekyll
+
       - uses: actions/configure-pages@v5
         with:
           enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: target/doc
+          path: public
 
   deploy:
     name: Deploy to GitHub Pages
