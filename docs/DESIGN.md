@@ -167,8 +167,11 @@ is unperturbed and determinism holds), plus point queries (`trail_at`, `food_at`
   the connecting structure) read out whether — and how cheaply — the maze is solved.
 - **Inspector** — hovering reads the trail/food under the cursor and the nearest agent's
   species and energy.
-- **Sharing** — the seed and every per-species parameter encode into the URL hash; opening the
-  link restores the run.
+- **Sharing & presets** — a named **preset gallery** loads classical scenarios (capillary mesh,
+  trunk roads, spirals, boom/bust, competitive exclusion, coexistence, the maze, Tokyo rail) in
+  one click. The seed, both species' parameters and ecology, the chemotaxis and reachability
+  knobs, the endpoint wells, and a tag for any built-in procedural geometry encode into the URL
+  hash, so a scenario — preset or hand-tuned — restores from a single link.
 
 ## Decisions log (ADR-lite)
 
@@ -252,6 +255,16 @@ cadence — so the hot loop and the no-alloc/determinism invariants are untouche
 number reads out the maze demo; richer topology metrics are not computed in the tick. *Rejected:*
 folding a graph search into every `tick` (heavy, and the answer is needed at UI cadence, not tick
 cadence).
+
+**D14 — Presets are in-code TS scenario data applied through the live setters; the share codec
+carries geometry by endpoint-list + a built-in tag, not raw masks.** The whole gallery is plain
+TS data plus a single `applyScenario` (reset → setters → rebuild geometry → re-fetch views), so
+no preset machinery leaks into the sim core — the geometry boundary already exposes everything a
+scenario needs. The URL hash encodes the endpoint list and a compact tag for procedural walls
+(the maze regenerates from its tag) rather than the full obstacle mask, keeping links short;
+hand-painted masks are deliberately not shareable. *Rejected:* a Rust-side scenario format and a
+second (de)serialization path across the wasm boundary (the app already owns the parameter
+surface and the URL codec); packing the raw mask into the URL (too large).
 
 ## Out of current scope (not deleted)
 
