@@ -408,6 +408,86 @@ impl Sim {
         self.inner.cross_sense(species as usize, other as usize)
     }
 
+    // --- Evolution: a single heritable trait (`sensor_distance`) per agent, mutated
+    // on reproduction and selected by the food/geometry landscape. Default off →
+    // byte-identical to the base rule (no extra RNG, the trait field stays zero). ---
+
+    /// Enable or disable evolution for `species`. Enabling seeds a **uniform
+    /// population** at the current `sensor_distance` (every live agent of `species`
+    /// reset to the param), then births mutate it so the trait drifts under selection.
+    /// While *no* species has evolution on, the sim runs the byte-identical base rule.
+    /// Disabling the last evolving species clears the trait field. In-place (no
+    /// re-fetch of the field/food views needed).
+    pub fn set_evolution(&mut self, species: u32, enabled: bool) {
+        self.inner.set_evolution(species as usize, enabled);
+    }
+
+    /// Whether evolution is enabled for `species` (for the panel). `false` for an
+    /// out-of-range index.
+    pub fn evolution_enabled(&self, species: u32) -> bool {
+        self.inner.evolution_enabled(species as usize)
+    }
+
+    /// Set `species`' per-birth mutation strength — the std-dev (cells) of the
+    /// Gaussian added to a child's inherited `sensor_distance`, clamped non-negative.
+    /// Only consulted while evolution is enabled for that species. Takes effect next
+    /// tick; no rebuild.
+    pub fn set_mutation_strength(&mut self, species: u32, strength: f32) {
+        self.inner.set_mutation_strength(species as usize, strength);
+    }
+
+    /// `species`' current per-birth mutation strength (cells). `0.0` for an
+    /// out-of-range index.
+    pub fn mutation_strength(&self, species: u32) -> f32 {
+        self.inner.mutation_strength(species as usize)
+    }
+
+    /// Mean of the heritable `sensor_distance` trait over `species`' live agents
+    /// (cells). `0.0` when the species has no live agents or is out of range.
+    pub fn trait_mean(&self, species: u32) -> f32 {
+        self.inner.trait_mean(species as usize)
+    }
+
+    /// Population std-dev of the `sensor_distance` trait over `species`' live agents.
+    /// `0.0` when the species has fewer than two live agents or is out of range.
+    pub fn trait_std(&self, species: u32) -> f32 {
+        self.inner.trait_std(species as usize)
+    }
+
+    /// Smallest `sensor_distance` trait among `species`' live agents (cells). `0.0`
+    /// when the species has no live agents or is out of range.
+    pub fn trait_min(&self, species: u32) -> f32 {
+        self.inner.trait_min(species as usize)
+    }
+
+    /// Largest `sensor_distance` trait among `species`' live agents (cells). `0.0`
+    /// when the species has no live agents or is out of range.
+    pub fn trait_max(&self, species: u32) -> f32 {
+        self.inner.trait_max(species as usize)
+    }
+
+    /// Heritable `sensor_distance` trait of agent `i` (cells; the value it senses
+    /// with when its species is evolving). `0.0` for an out-of-range index. Valid only
+    /// until the next `tick`/`spawn`/`reset`, like the other `agent_*` getters.
+    pub fn agent_trait(&self, i: u32) -> f32 {
+        self.inner.agent_trait(i as usize)
+    }
+
+    /// Pointer to the trait field within WASM linear memory (`f32` per cell: the
+    /// `sensor_distance` of the last agent to deposit there, `0.0` where none has, and
+    /// everywhere while no species is evolving). Pair with [`Sim::trait_field_len`] to
+    /// build `new Float32Array(memory.buffer, ptr, len)` for a trait-map render mode.
+    /// Stable for the run (it never reallocates) — re-fetch only after a reset-class
+    /// call, like the field/obstacle views.
+    pub fn trait_field_ptr(&self) -> *const f32 {
+        self.inner.trait_field().as_ptr()
+    }
+
+    /// Length of the trait field in cells (`width * height`, same as a trail field).
+    pub fn trait_field_len(&self) -> usize {
+        self.inner.trait_field().len()
+    }
+
     /// Set the reachability threshold — the fraction of the current combined
     /// `field_max` a cell's combined trail must reach to count as network. Clamped to
     /// `[0, 1]`. Affects only the on-demand metric, not the sim.

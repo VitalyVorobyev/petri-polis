@@ -101,6 +101,21 @@ impl Rng {
     pub fn range(&mut self, max: f32) -> f32 {
         self.next_f32() * max
     }
+
+    /// Standard-normal `f32` (mean `0`, std `1`) via one Box–Muller transform.
+    /// Draws **exactly two** uniforms, in a fixed order, so it is deterministic and
+    /// its RNG-consumption is predictable for the determinism contract. Returns a
+    /// single normal (the second Box–Muller output is discarded — clarity over the
+    /// marginal saving; the heritable-trait mutation needs one draw per birth).
+    #[inline(always)]
+    pub fn next_gaussian(&mut self) -> f32 {
+        // Guard u1 away from 0 so ln() is finite (the open interval [0,1) can hand
+        // back exactly 0).
+        let u1 = self.next_f32().max(f32::MIN_POSITIVE);
+        let u2 = self.next_f32();
+        let r = (-2.0 * u1.ln()).sqrt();
+        r * (TAU * u2).cos()
+    }
 }
 
 /// Live, runtime-tunable Physarum parameters. Defaults are Jones-style and chosen
@@ -291,6 +306,16 @@ const INITIAL_ENERGY_FRAC: f32 = 0.6;
 /// Heading jitter (radians) applied to a child relative to its parent at birth.
 const BIRTH_HEADING_JITTER: f32 = 0.5;
 
+/// Inclusive clamp window (cells) for an agent's heritable `sensor_distance` trait —
+/// mirrors the renderer panel's `sensor_distance` slider range, so an evolving
+/// population drifts within the same bounds a user could dial by hand.
+const TRAIT_SENSOR_DISTANCE_MIN: f32 = 1.0;
+const TRAIT_SENSOR_DISTANCE_MAX: f32 = 32.0;
+/// Default per-birth mutation std-dev (cells) for a species the moment evolution is
+/// switched on. A gentle drift: small enough that selection — not noise — shapes the
+/// population, large enough that the trait measurably moves over a few hundred ticks.
+const DEFAULT_MUTATION_STRENGTH: f32 = 0.5;
+
 /// Spawn pattern selector for [`Sim::spawn`]. Numeric values match the
 /// `petri-wasm` integer API so the renderer can pass a plain `u32`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,10 +414,36 @@ pub struct Sim {
     /// Species tag in `0..SPECIES`, selecting which `params`/`ecology`/`field`
     /// each agent uses.
     species: Vec<u8>,
+    /// Per-agent **heritable** sensor distance (cells) — the one evolvable trait.
+    /// Kept in lockstep with the other agent arrays on every push/swap_remove. When
+    /// the agent's species has evolution **disabled** this value is held at the
+    /// species' `Params.sensor_distance` and never read (the sense path uses the
+    /// param directly), so a default run draws no extra RNG and stays byte-identical.
+    /// When enabled, the agent senses with *this* value and a child inherits the
+    /// parent's value plus a mutation. Pre-allocated to capacity at `new`.
+    sensor_distance: Vec<f32>,
 
     rng: Rng,
     params: [Params; SPECIES],
     ecology: [Ecology; SPECIES],
+
+    /// Per-species evolution switch. When `evolution_enabled[s]` is `false` (the
+    /// default for every species) agents of species `s` sense with the species
+    /// `Params.sensor_distance` and reproduction draws no mutation RNG — bit-for-bit
+    /// the pre-existing rule. Flipping it on (via [`Sim::set_evolution`]) seeds every
+    /// live agent of that species to the current `Params.sensor_distance` (a uniform
+    /// population) and switches that species onto the per-agent, mutating path.
+    evolution_enabled: [bool; SPECIES],
+    /// Per-species std-dev (cells) of the per-birth Gaussian mutation applied to the
+    /// inherited `sensor_distance`. Only consulted when `evolution_enabled[s]`.
+    mutation_strength: [f32; SPECIES],
+    /// Per-cell map of the depositing agent's evolved `sensor_distance`, row-major
+    /// `width * height`, for the renderer's trait-map mode (color the network by local
+    /// evolved trait). Latest-deposit-wins: each deposit overwrites its cell. Stays
+    /// all-zero and is never written while no species has evolution enabled (the
+    /// `evolution_active` gate), so it is costless by default. Allocated once at `new`;
+    /// never reallocated (JS aliases it zero-copy, like the obstacle mask).
+    trait_field: Vec<f32>,
 
     /// Signed cross-species sensing weights: `cross_sense[s][o]` is how strongly an
     /// agent of species `s` is pulled by species `o`'s trail when sampling a sensor.
@@ -465,9 +516,13 @@ impl Sim {
             heading: Vec::with_capacity(capacity),
             energy: Vec::with_capacity(capacity),
             species: Vec::with_capacity(capacity),
+            sensor_distance: Vec::with_capacity(capacity),
             rng: Rng::seed(seed),
             params,
             ecology,
+            evolution_enabled: [false; SPECIES],
+            mutation_strength: [DEFAULT_MUTATION_STRENGTH; SPECIES],
+            trait_field: vec![0.0; cells],
             cross_sense: identity_cross_sense(),
             network_threshold: DEFAULT_NETWORK_THRESHOLD,
             visited: vec![0u32; cells],
@@ -603,6 +658,187 @@ impl Sim {
         }
     }
 
+    // --- Evolution: a single heritable trait (`sensor_distance`) under selection by
+    // the food/geometry landscape. Default off → byte-identical to the base rule. ---
+
+    /// Whether evolution is enabled for `species`. `false` by default (and for any
+    /// out-of-range index): agents sense with the species `Params.sensor_distance` and
+    /// reproduction draws no mutation, so the run is bit-for-bit the base rule.
+    pub fn evolution_enabled(&self, species: usize) -> bool {
+        species < SPECIES && self.evolution_enabled[species]
+    }
+
+    /// Enable or disable evolution for `species`. Enabling **seeds a uniform
+    /// population**: every live agent of `species` is set to the current
+    /// `Params.sensor_distance` (the species default), so the population starts
+    /// monomorphic and then drifts under selection as births mutate it. Disabling
+    /// freezes sensing back onto the species param (the stored traits are kept but no
+    /// longer read). Out-of-range indices are ignored. Idempotent on the already-set
+    /// state. No RNG, no reallocation.
+    pub fn set_evolution(&mut self, species: usize, enabled: bool) {
+        if species >= SPECIES {
+            return;
+        }
+        self.evolution_enabled[species] = enabled;
+        if enabled {
+            // Reseed this species to a uniform population at the current param value,
+            // so "evolution on" always starts from a clean monomorphic baseline
+            // regardless of what the agents drifted to under a previous enable.
+            let seed = self.params[species].sensor_distance;
+            let tag = species as u8;
+            for i in 0..self.species.len() {
+                if self.species[i] == tag {
+                    self.sensor_distance[i] = seed;
+                }
+            }
+        } else if !self.evolution_active() {
+            // Last species turned off → the trait map is now stale and never updated;
+            // clear it so the renderer's trait mode shows nothing rather than a frozen
+            // ghost of the last evolving frame.
+            self.clear_trait_field();
+        }
+    }
+
+    /// Per-birth mutation std-dev (cells) for `species` — the standard deviation of
+    /// the Gaussian added to a child's inherited `sensor_distance`. Out-of-range
+    /// indices return `0.0`.
+    pub fn mutation_strength(&self, species: usize) -> f32 {
+        if species < SPECIES {
+            self.mutation_strength[species]
+        } else {
+            0.0
+        }
+    }
+
+    /// Set the per-birth mutation std-dev (cells) for `species`. Clamped to be
+    /// non-negative (a `0` strength makes reproduction copy the trait exactly, but
+    /// while the species is evolving it still draws the mutation RNG — the gating is
+    /// on the enable flag, not on this value). Out-of-range indices are ignored.
+    pub fn set_mutation_strength(&mut self, species: usize, strength: f32) {
+        if species < SPECIES {
+            self.mutation_strength[species] = strength.max(0.0);
+        }
+    }
+
+    /// Heritable `sensor_distance` trait of agent `i` (cells), or `0.0` if `i` is out
+    /// of range. For a non-evolving species this is the species default (the value the
+    /// agent senses with). Valid until the next `tick`/`spawn`/`reset`.
+    pub fn agent_trait(&self, i: usize) -> f32 {
+        if i < self.sensor_distance.len() {
+            self.sensor_distance[i]
+        } else {
+            0.0
+        }
+    }
+
+    /// Mean of the heritable `sensor_distance` trait over `species`' live agents, or
+    /// `0.0` when the species has no live agents (or is out of range). O(n).
+    pub fn trait_mean(&self, species: usize) -> f32 {
+        if species >= SPECIES {
+            return 0.0;
+        }
+        let tag = species as u8;
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for i in 0..self.species.len() {
+            if self.species[i] == tag {
+                sum += self.sensor_distance[i] as f64;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            0.0
+        } else {
+            (sum / count as f64) as f32
+        }
+    }
+
+    /// Population standard deviation of the `sensor_distance` trait over `species`'
+    /// live agents, or `0.0` when the species has fewer than two live agents (or is
+    /// out of range). O(n).
+    pub fn trait_std(&self, species: usize) -> f32 {
+        if species >= SPECIES {
+            return 0.0;
+        }
+        let tag = species as u8;
+        let mut sum = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        let mut count = 0usize;
+        for i in 0..self.species.len() {
+            if self.species[i] == tag {
+                let v = self.sensor_distance[i] as f64;
+                sum += v;
+                sum_sq += v * v;
+                count += 1;
+            }
+        }
+        if count < 2 {
+            return 0.0;
+        }
+        let n = count as f64;
+        let mean = sum / n;
+        let var = (sum_sq / n - mean * mean).max(0.0);
+        var.sqrt() as f32
+    }
+
+    /// Smallest `sensor_distance` trait among `species`' live agents, or `0.0` when
+    /// the species has no live agents (or is out of range). O(n).
+    pub fn trait_min(&self, species: usize) -> f32 {
+        if species >= SPECIES {
+            return 0.0;
+        }
+        let tag = species as u8;
+        let mut best = f32::INFINITY;
+        for i in 0..self.species.len() {
+            if self.species[i] == tag && self.sensor_distance[i] < best {
+                best = self.sensor_distance[i];
+            }
+        }
+        if best.is_finite() {
+            best
+        } else {
+            0.0
+        }
+    }
+
+    /// Largest `sensor_distance` trait among `species`' live agents, or `0.0` when the
+    /// species has no live agents (or is out of range). O(n).
+    pub fn trait_max(&self, species: usize) -> f32 {
+        if species >= SPECIES {
+            return 0.0;
+        }
+        let tag = species as u8;
+        let mut best = f32::NEG_INFINITY;
+        for i in 0..self.species.len() {
+            if self.species[i] == tag && self.sensor_distance[i] > best {
+                best = self.sensor_distance[i];
+            }
+        }
+        if best.is_finite() {
+            best
+        } else {
+            0.0
+        }
+    }
+
+    /// Read-only view of the trait field (row-major, `len == width * height`): each
+    /// cell holds the `sensor_distance` of the last agent to deposit there, or `0.0`
+    /// where no agent has deposited (and everywhere while no species is evolving — the
+    /// field is gated off then). `petri-wasm` hands JS a zero-copy pointer into this
+    /// buffer for a trait-map render mode.
+    pub fn trait_field(&self) -> &[f32] {
+        &self.trait_field
+    }
+
+    /// Zero the trait field in place (the buffer is never reallocated). Used when
+    /// evolution turns fully off and on the reset/maze paths so a stale trait map
+    /// doesn't linger.
+    fn clear_trait_field(&mut self) {
+        for v in self.trait_field.iter_mut() {
+            *v = 0.0;
+        }
+    }
+
     /// Whether the cross-sensing matrix differs from the identity. When `false` (the
     /// default), the sense path uses the single-field fast path and a run is
     /// bit-for-bit identical to the pre-existing rule. Any off-diagonal `!= 0.0` or
@@ -618,6 +854,15 @@ impl Sim {
             }
         }
         false
+    }
+
+    /// Whether *any* species has evolution enabled. When `false` (the default) the
+    /// agent pass takes the species-`Params.sensor_distance` sense path, reproduction
+    /// draws no mutation RNG, and the trait field is never written — so a run is
+    /// bit-for-bit identical to the pre-evolution rule.
+    #[inline]
+    fn evolution_active(&self) -> bool {
+        self.evolution_enabled.iter().any(|&e| e)
     }
 
     // --- Read-only inspection: point queries and per-agent getters. These never
@@ -741,11 +986,19 @@ impl Sim {
         // Cross-sensing is world state: a fresh world senses only own trails, so
         // restoring the identity keeps `reset` byte-identical to a fresh `new`.
         self.cross_sense = identity_cross_sense();
+        // Evolution is world state: a fresh world starts with evolution off and a
+        // cleared trait map (mutation strengths return to the default), so `reset` is
+        // byte-identical to a fresh `new`. Per-agent traits are dropped with the
+        // arrays and reseeded to the species defaults by `spawn_initial`.
+        self.evolution_enabled = [false; SPECIES];
+        self.mutation_strength = [DEFAULT_MUTATION_STRENGTH; SPECIES];
+        self.clear_trait_field();
         self.x.clear();
         self.y.clear();
         self.heading.clear();
         self.energy.clear();
         self.species.clear();
+        self.sensor_distance.clear();
         // Mirror `with_capacity`'s RNG draw order exactly: patches first (which
         // also refills `food` from the fresh caps), then the initial population.
         self.generate_food_patches();
@@ -790,6 +1043,10 @@ impl Sim {
             self.heading.push(self.rng.range(TAU));
             self.energy.push(self.initial_energy(s));
             self.species.push(s as u8);
+            // Uniform-population seeding: a spawned agent starts at its species'
+            // current `sensor_distance` (the species default trait). No RNG — keeps
+            // the spawn draw order byte-identical whether or not evolution is on.
+            self.sensor_distance.push(self.params[s].sensor_distance);
         }
         n
     }
@@ -811,6 +1068,8 @@ impl Sim {
             self.heading.push(self.rng.range(TAU));
             self.energy.push(self.initial_energy(s));
             self.species.push(s as u8);
+            // Uniform-population trait seeding (no RNG; see `spawn`).
+            self.sensor_distance.push(self.params[s].sensor_distance);
         }
     }
 
@@ -1125,6 +1384,11 @@ impl Sim {
         for v in self.field_b.iter_mut() {
             *v = 0.0;
         }
+        // The maze is a fresh scenario: evolution off, trait map cleared. The agent
+        // arrays (including `sensor_distance`) are rebuilt below, so the new uniform
+        // population starts at each species' `Params.sensor_distance`.
+        self.evolution_enabled = [false; SPECIES];
+        self.clear_trait_field();
         // Caps start empty: the maze relies on the two endpoint wells only, so a
         // crashed front can't shelter in a random patch and ignore the maze.
         for v in self.food_cap.iter_mut() {
@@ -1216,6 +1480,7 @@ impl Sim {
         self.heading.clear();
         self.energy.clear();
         self.species.clear();
+        self.sensor_distance.clear();
         let count = (w * h / 8).min(self.capacity());
         for i in 0..count {
             let s = i % SPECIES;
@@ -1238,6 +1503,8 @@ impl Sim {
             self.heading.push(self.rng.range(TAU));
             self.energy.push(self.initial_energy(s));
             self.species.push(s as u8);
+            // Uniform-population trait seeding (no RNG; see `spawn`).
+            self.sensor_distance.push(self.params[s].sensor_distance);
         }
     }
 
@@ -1788,6 +2055,10 @@ impl Sim {
         // change mid-pass — so hoist it out of the per-agent loop.
         let has_walls = self.obstacle_count != 0;
         let cross = self.cross_sense_active();
+        // Whole-tick constant (the switch can't change mid-pass): when no species has
+        // evolution on, the per-agent trait is never read or written, so every branch
+        // below collapses to the pre-evolution arithmetic and RNG draw order.
+        let evolving = self.evolution_active();
 
         // --- Phase 1: sense → steer → move → eat → deposit, pay metabolism. ---
         for i in 0..n {
@@ -1797,6 +2068,13 @@ impl Sim {
             let heading = self.heading[i];
             let cx = self.x[i];
             let cy = self.y[i];
+            // An evolution-enabled agent senses with its own heritable trait; every
+            // other agent uses the species param (byte-identical to the old rule).
+            let sensor_distance = if evolving && self.evolution_enabled[s] {
+                self.sensor_distance[i]
+            } else {
+                p.sensor_distance
+            };
 
             // 1. Sense this species' own field at three points at sensor_distance:
             //    center, left, right. With obstacles present, a sensor over a wall
@@ -1806,21 +2084,21 @@ impl Sim {
             let (f, l, r) = if !has_walls && attract == 0.0 && !cross {
                 // Default path — bit-for-bit identical to the pre-geography rule.
                 (
-                    self.sense(s, cx, cy, heading, p.sensor_distance),
-                    self.sense(s, cx, cy, heading - p.sensor_angle, p.sensor_distance),
-                    self.sense(s, cx, cy, heading + p.sensor_angle, p.sensor_distance),
+                    self.sense(s, cx, cy, heading, sensor_distance),
+                    self.sense(s, cx, cy, heading - p.sensor_angle, sensor_distance),
+                    self.sense(s, cx, cy, heading + p.sensor_angle, sensor_distance),
                 )
             } else if cross {
                 // Cross-sensing path: each sensor reads the weighted sum of every
                 // species' trail (the signed `cross_sense` row), plus the food term.
                 (
-                    self.sense_cross(s, cx, cy, heading, p.sensor_distance, attract, has_walls),
+                    self.sense_cross(s, cx, cy, heading, sensor_distance, attract, has_walls),
                     self.sense_cross(
                         s,
                         cx,
                         cy,
                         heading - p.sensor_angle,
-                        p.sensor_distance,
+                        sensor_distance,
                         attract,
                         has_walls,
                     ),
@@ -1829,20 +2107,20 @@ impl Sim {
                         cx,
                         cy,
                         heading + p.sensor_angle,
-                        p.sensor_distance,
+                        sensor_distance,
                         attract,
                         has_walls,
                     ),
                 )
             } else {
                 (
-                    self.sense_full(s, cx, cy, heading, p.sensor_distance, attract, has_walls),
+                    self.sense_full(s, cx, cy, heading, sensor_distance, attract, has_walls),
                     self.sense_full(
                         s,
                         cx,
                         cy,
                         heading - p.sensor_angle,
-                        p.sensor_distance,
+                        sensor_distance,
                         attract,
                         has_walls,
                     ),
@@ -1851,7 +2129,7 @@ impl Sim {
                         cx,
                         cy,
                         heading + p.sensor_angle,
-                        p.sensor_distance,
+                        sensor_distance,
                         attract,
                         has_walls,
                     ),
@@ -1907,6 +2185,14 @@ impl Sim {
 
             // 5. Deposit trail into this species' own field at the agent's new cell.
             self.field[s][idx] += p.deposit_amount;
+
+            // 6. Trait map: stamp the depositing agent's sensor distance into its cell
+            //    (latest-deposit-wins) so the renderer can color the network by local
+            //    evolved trait. Gated on any species evolving — when evolution is off
+            //    the field is never touched and stays all-zero (costless by default).
+            if evolving {
+                self.trait_field[idx] = sensor_distance;
+            }
         }
 
         // --- Phase 2: reproduce. Children land at indices ≥ n (not processed
@@ -1918,12 +2204,29 @@ impl Sim {
             if self.energy[i] >= self.ecology[s].repro_threshold && self.x.len() < cap {
                 let child_energy = self.energy[i] * 0.5;
                 self.energy[i] = child_energy;
+                // RNG draw order at a birth is load-bearing for determinism: the
+                // heading jitter is drawn first (exactly as before), then — only when
+                // this agent's species is evolving — the trait mutation. So a birth in
+                // a non-evolving run consumes the same single RNG draw it always has.
                 let jitter = (self.rng.next_f32() - 0.5) * 2.0 * BIRTH_HEADING_JITTER;
+                let child_trait = if evolving && self.evolution_enabled[s] {
+                    // Inherit the parent's trait plus a Gaussian mutation (std =
+                    // `mutation_strength`), clamped to the sane trait window. The two
+                    // Box–Muller uniforms are drawn after the jitter draw.
+                    let delta = self.rng.next_gaussian() * self.mutation_strength[s];
+                    (self.sensor_distance[i] + delta)
+                        .clamp(TRAIT_SENSOR_DISTANCE_MIN, TRAIT_SENSOR_DISTANCE_MAX)
+                } else {
+                    // Non-evolving species: the child carries the parent's stored
+                    // trait verbatim (the species default) and no RNG is drawn.
+                    self.sensor_distance[i]
+                };
                 self.x.push(self.x[i]);
                 self.y.push(self.y[i]);
                 self.heading.push(self.heading[i] + jitter);
                 self.energy.push(child_energy);
                 self.species.push(s as u8);
+                self.sensor_distance.push(child_trait);
             }
         }
 
@@ -1942,6 +2245,7 @@ impl Sim {
                 self.heading.swap_remove(i);
                 self.energy.swap_remove(i);
                 self.species.swap_remove(i);
+                self.sensor_distance.swap_remove(i);
             } else {
                 i += 1;
             }
@@ -2307,8 +2611,14 @@ mod tests {
         let cap = sim.capacity();
         let energy_cap = sim.energy.capacity();
         let species_cap = sim.species.capacity();
+        let trait_cap = sim.sensor_distance.capacity();
         let field_ptrs: [_; SPECIES] = std::array::from_fn(|s| sim.field(s).as_ptr());
         let food_ptr = sim.food().as_ptr();
+        let trait_field_ptr = sim.trait_field().as_ptr();
+        // Enabling evolution mid-life must not reallocate any agent array or the
+        // trait field (it only reseeds in place).
+        sim.set_evolution(0, true);
+        sim.set_mutation_strength(0, 0.4);
         for _ in 0..30 {
             sim.tick();
         }
@@ -2328,6 +2638,16 @@ mod tests {
             sim.species.capacity(),
             species_cap,
             "species capacity must not change"
+        );
+        assert_eq!(
+            sim.sensor_distance.capacity(),
+            trait_cap,
+            "sensor_distance (trait) capacity must not change"
+        );
+        assert_eq!(
+            sim.trait_field().as_ptr(),
+            trait_field_ptr,
+            "trait field buffer must not reallocate"
         );
         for (s, &ptr) in field_ptrs.iter().enumerate() {
             assert_eq!(
@@ -2944,6 +3264,7 @@ mod tests {
         sim.heading.clear();
         sim.energy.clear();
         sim.species.clear();
+        sim.sensor_distance.clear();
         sim.clear_obstacles();
         // A full-height wall at column 32. Make the ecology benign so the lone agent
         // neither starves nor reproduces during the test.
@@ -2960,6 +3281,7 @@ mod tests {
         sim.heading.push(0.0);
         sim.energy.push(1.0);
         sim.species.push(0);
+        sim.sensor_distance.push(sim.params(0).sensor_distance);
         for _ in 0..200 {
             sim.tick();
             assert_eq!(sim.agent_count(), 1, "the lone agent must persist");
@@ -3360,6 +3682,309 @@ mod tests {
             checksum_all(&sim),
             GOLDEN_CHECKSUM,
             "querying structure metrics must not perturb the sim (read-only)"
+        );
+    }
+
+    // --- Evolution: heritable `sensor_distance` trait ---
+
+    /// Evolution is **off by default** and fully inert: a run with no evolution call
+    /// reproduces the baseline golden, the trait field stays all-zero, and every
+    /// agent's stored trait equals its species default. This is the byte-identity
+    /// guard for the whole feature.
+    #[test]
+    fn evolution_off_is_inert() {
+        const GOLDEN_SEED: u64 = 0xABCD_1234;
+        const TICKS: usize = 60;
+        const GOLDEN_CHECKSUM: u64 = 0x8de7_8e52_803c_7618;
+
+        let mut sim = Sim::new(128, 128, GOLDEN_SEED);
+        // Defaults: evolution disabled on every species.
+        for s in 0..SPECIES {
+            assert!(
+                !sim.evolution_enabled(s),
+                "species {s} must start non-evolving"
+            );
+        }
+        for _ in 0..TICKS {
+            sim.tick();
+        }
+        assert_eq!(
+            checksum_all(&sim),
+            GOLDEN_CHECKSUM,
+            "evolution-off run drifted from the baseline golden"
+        );
+        // The trait field is gated off → all zero, and never written.
+        assert!(
+            sim.trait_field().iter().all(|&v| v == 0.0),
+            "trait field must stay zero while evolution is off"
+        );
+        // Every stored trait equals its species' default sensor_distance.
+        for i in 0..sim.agent_count() {
+            let s = sim.agent_species(i);
+            assert_eq!(
+                sim.agent_trait(i),
+                sim.params(s).sensor_distance,
+                "non-evolving agent {i} must carry the species default trait"
+            );
+        }
+    }
+
+    /// Enabling evolution seeds a uniform population at the species default, the
+    /// API round-trips, and `reset` restores evolution to disabled + the trait map to
+    /// zero (so a fresh world is byte-identical to `new`).
+    #[test]
+    fn evolution_api_seeds_uniform_and_reset_restores() {
+        let mut sim = Sim::new(96, 96, 5);
+        let s = 0usize;
+        let def = sim.params(s).sensor_distance;
+
+        // Enable + set a strength: both round-trip.
+        sim.set_evolution(s, true);
+        sim.set_mutation_strength(s, 0.7);
+        assert!(sim.evolution_enabled(s));
+        assert_eq!(sim.mutation_strength(s), 0.7);
+
+        // Every live agent of species s is seeded to the species default (uniform).
+        for i in 0..sim.agent_count() {
+            if sim.agent_species(i) == s {
+                assert_eq!(sim.agent_trait(i), def, "enable must seed a uniform pop");
+            }
+        }
+        // A uniform population has zero spread and a mean at the default.
+        assert!((sim.trait_mean(s) - def).abs() < 1e-6);
+        assert_eq!(sim.trait_std(s), 0.0);
+        assert_eq!(sim.trait_min(s), def);
+        assert_eq!(sim.trait_max(s), def);
+
+        // Out-of-range API is safe.
+        assert!(!sim.evolution_enabled(SPECIES));
+        sim.set_evolution(SPECIES, true); // no-op
+        assert_eq!(sim.mutation_strength(SPECIES), 0.0);
+        assert_eq!(sim.trait_mean(SPECIES), 0.0);
+
+        // Drift the population, then reset and confirm a clean, byte-identical world.
+        for _ in 0..40 {
+            sim.tick();
+        }
+        sim.reset(5);
+        for st in 0..SPECIES {
+            assert!(!sim.evolution_enabled(st), "reset must disable evolution");
+            assert_eq!(
+                sim.mutation_strength(st),
+                DEFAULT_MUTATION_STRENGTH,
+                "reset must restore the default mutation strength"
+            );
+        }
+        assert!(
+            sim.trait_field().iter().all(|&v| v == 0.0),
+            "reset must clear the trait field"
+        );
+        // A fresh world reproduces the baseline golden (reset == new).
+        for _ in 0..60 {
+            sim.tick();
+        }
+        // (Different seed/size than the golden — just assert determinism via a re-run.)
+        let mut twin = Sim::new(96, 96, 5);
+        twin.reset(5);
+        for _ in 0..60 {
+            twin.tick();
+        }
+        assert_eq!(
+            checksum_all(&sim),
+            checksum_all(&twin),
+            "reset-then-run must be reproducible"
+        );
+    }
+
+    /// An **evolution-on** scenario is deterministic — two independent runs with the
+    /// same seed reproduce identical fields and an identical trait-mean trajectory —
+    /// and matches a pinned golden. Distinct from the baseline golden (evolution
+    /// genuinely changes the dynamics). If the rule changes on purpose, run once and
+    /// paste the new value.
+    #[test]
+    fn evolution_on_is_deterministic() {
+        const SEED: u64 = 0xABCD_1234;
+        const TICKS: usize = 200;
+
+        let run = || {
+            let mut sim = Sim::new(128, 128, SEED);
+            // Evolve species 0's sensor distance with a healthy mutation strength.
+            sim.set_evolution(0, true);
+            sim.set_mutation_strength(0, 1.0);
+            let mut means = Vec::with_capacity(TICKS);
+            for _ in 0..TICKS {
+                sim.tick();
+                means.push(sim.trait_mean(0).to_bits());
+            }
+            (checksum_all(&sim), sim.trait_mean(0).to_bits(), means)
+        };
+        let (sum_a, mean_a, traj_a) = run();
+        let (sum_b, mean_b, traj_b) = run();
+        assert_eq!(
+            sum_a, sum_b,
+            "two evolution runs of the same seed must match"
+        );
+        assert_eq!(mean_a, mean_b, "final trait_mean must match across runs");
+        assert_eq!(
+            traj_a, traj_b,
+            "the whole trait_mean trajectory must be reproducible bit-for-bit"
+        );
+
+        const EVOLUTION_GOLDEN_CHECKSUM: u64 = 0x8651_610e_f6bc_1b49;
+        assert_eq!(
+            sum_a, EVOLUTION_GOLDEN_CHECKSUM,
+            "evolution-on combined field checksum drifted from golden"
+        );
+
+        // Evolution must actually change the field vs. the identical-seed off run.
+        const OFF_GOLDEN: u64 = 0x8de7_8e52_803c_7618;
+        // (The off golden is at 60 ticks; here we only assert the evolving run differs
+        // from a same-seed, same-tick non-evolving run.)
+        let mut off = Sim::new(128, 128, SEED);
+        for _ in 0..TICKS {
+            off.tick();
+        }
+        let _ = OFF_GOLDEN;
+        assert_ne!(
+            sum_a,
+            checksum_all(&off),
+            "an evolving run must differ from the same-seed non-evolving run"
+        );
+    }
+
+    /// Under a fixed landscape with selection, the `sensor_distance` trait
+    /// **measurably drifts** away from the species default (beyond a noise floor), the
+    /// drift is **reproducible** (two same-seed runs trace an identical trait-mean
+    /// trajectory), and the trait map is populated. The setup pins down only drift
+    /// magnitude + reproducibility, not a direction.
+    #[test]
+    fn evolution_drifts_and_is_reproducible() {
+        const SEED: u64 = 0x00C0_FFEE;
+        const TICKS: usize = 800;
+        let species = 0usize;
+
+        let run = || {
+            let mut sim = Sim::new(160, 160, SEED);
+            sim.set_evolution(species, true);
+            sim.set_mutation_strength(species, 1.0);
+            let start = sim.trait_mean(species);
+            let mut traj = Vec::with_capacity(TICKS);
+            for _ in 0..TICKS {
+                sim.tick();
+                traj.push(sim.trait_mean(species).to_bits());
+            }
+            (start, sim, traj)
+        };
+
+        let (start, mut sim, traj_a) = run();
+        let (start_b, _, traj_b) = run();
+
+        // The population started monomorphic at the species default.
+        let def = sim.params(species).sensor_distance;
+        assert!(
+            (start - def).abs() < 1e-6,
+            "should start at the species default"
+        );
+        assert_eq!(start, start_b);
+
+        // Reproducible evolution: identical trait-mean trajectory, bit-for-bit.
+        assert_eq!(
+            traj_a, traj_b,
+            "same-seed evolution must trace an identical trait_mean trajectory"
+        );
+
+        // Measurable drift: the mean moved well beyond a per-birth-noise floor, and a
+        // real spread has opened up across the population.
+        let end_mean = sim.trait_mean(species);
+        let drift = (end_mean - def).abs();
+        const DRIFT_FLOOR: f32 = 0.75; // cells — far above f32 noise / a single birth
+        assert!(
+            drift > DRIFT_FLOOR,
+            "trait_mean barely moved: |{end_mean} - {def}| = {drift} <= {DRIFT_FLOOR}"
+        );
+        assert!(
+            sim.trait_std(species) > 0.1,
+            "an evolving population must develop a real trait spread"
+        );
+        // min/max bracket the mean and sit inside the clamp window.
+        assert!(sim.trait_min(species) <= end_mean && end_mean <= sim.trait_max(species));
+        assert!(sim.trait_min(species) >= TRAIT_SENSOR_DISTANCE_MIN - 1e-6);
+        assert!(sim.trait_max(species) <= TRAIT_SENSOR_DISTANCE_MAX + 1e-6);
+
+        // The trait map is populated where the evolving species deposited.
+        assert!(
+            sim.trait_field().iter().any(|&v| v > 0.0),
+            "the trait field must be written while evolution is on"
+        );
+
+        // Turning evolution fully off clears the trait map (no frozen ghost).
+        sim.set_evolution(species, false);
+        assert!(
+            sim.trait_field().iter().all(|&v| v == 0.0),
+            "disabling the last evolving species clears the trait map"
+        );
+    }
+
+    /// The mutation clamp holds: even with a huge mutation strength, no agent's trait
+    /// ever leaves the `[MIN, MAX]` window across a long evolving run.
+    #[test]
+    fn evolution_trait_stays_clamped() {
+        let mut sim = Sim::new(128, 128, 11);
+        sim.set_evolution(0, true);
+        sim.set_evolution(1, true);
+        sim.set_mutation_strength(0, 8.0); // absurdly large → would blow past bounds
+        sim.set_mutation_strength(1, 8.0);
+        for _ in 0..400 {
+            sim.tick();
+            for i in 0..sim.agent_count() {
+                let t = sim.agent_trait(i);
+                assert!(
+                    (TRAIT_SENSOR_DISTANCE_MIN..=TRAIT_SENSOR_DISTANCE_MAX).contains(&t),
+                    "trait {t} escaped the clamp window"
+                );
+            }
+        }
+    }
+
+    /// `next_gaussian` is deterministic, draws exactly two uniforms per call, and has
+    /// roughly standard-normal statistics over a large sample.
+    #[test]
+    fn gaussian_is_deterministic_and_standard() {
+        let mut a = Rng::seed(2024);
+        let mut b = Rng::seed(2024);
+        for _ in 0..1000 {
+            assert_eq!(a.next_gaussian(), b.next_gaussian());
+        }
+        // Two-uniform consumption: a Gaussian call advances the stream by exactly the
+        // same amount as two next_f32 calls.
+        let mut c = Rng::seed(7);
+        let mut d = Rng::seed(7);
+        let _ = c.next_gaussian();
+        let _ = d.next_f32();
+        let _ = d.next_f32();
+        assert_eq!(
+            c.next_u64(),
+            d.next_u64(),
+            "gaussian must consume two uniforms"
+        );
+
+        // Statistics: mean ~0, std ~1 over a large sample.
+        let mut r = Rng::seed(99);
+        let n = 100_000;
+        let mut sum = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        for _ in 0..n {
+            let g = r.next_gaussian() as f64;
+            sum += g;
+            sum_sq += g * g;
+        }
+        let mean = sum / n as f64;
+        let var = sum_sq / n as f64 - mean * mean;
+        assert!(mean.abs() < 0.02, "gaussian mean {mean} not ~0");
+        assert!(
+            (var.sqrt() - 1.0).abs() < 0.03,
+            "gaussian std {} not ~1",
+            var.sqrt()
         );
     }
 }

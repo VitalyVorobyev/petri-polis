@@ -10,8 +10,9 @@ demo; M7 added a one-click gallery of classical scenarios that round-trip as sha
 added cross-species sensing (a signed 2×2 matrix) for territories and predator/prey; M9 added
 structure metrics (components, loops, fractal dimension, grain) and made them visible as
 measured phase transitions; M10 added a headless parameter sweep that emits reproducible
-phase-diagram figures. It all publishes to GitHub Pages (live demo + guide + API docs).
-**M11 is the last remaining lab milestone.**
+phase-diagram figures; M11 added heritable-trait evolution — a trait distribution that drifts
+under selection and replays exactly from the seed. It all publishes to GitHub Pages (live demo +
+guide + API docs). **The M6–M11 lab arc is complete.**
 
 **From toy to lab.** The toy proves emergence is fun and reproducible; the lab proves the toy
 *computes* — it reproduces classical complex-systems demos as one-click presets — and lets you
@@ -107,7 +108,7 @@ companions), and emit a CSV plus a hand-rolled SVG phase diagram (a heatmap in 2
 **Gate:** a reproducible phase-diagram CSV — and a plotted figure — locating a regime boundary;
 a `decay` sweep collapses the component count from ~17 to ~2 at the consolidation threshold.
 
-## M11 — Evolution: heritable traits
+## M11 — Evolution: heritable traits ✅ done
 On reproduction, copy the parent's params with a small mutation instead of the species default,
 so strategies evolve under selection by the food and geometry landscape — no RL or learned
 behavior. Trait-distribution metric + trait/age coloring.

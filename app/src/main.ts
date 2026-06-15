@@ -251,6 +251,50 @@ void main() {
 }`;
 
 // ---------------------------------------------------------------------------
+// Trait map — colour each cell by the local evolved sensor_distance (the
+// latest-deposit-wins trait field). The trait lives in ≈[1,32] cells; we map it
+// through a perceptual short→long gradient so the two strategies separate by
+// hue: short-sighted (small reach) reads warm amber, long-sighted (large reach)
+// reads cool violet, with a teal midband. Cells of exactly 0 (no deposit, or
+// evolution off) render near-black so only where a strategy actually lives is
+// lit. Sampled with the field texture's filtering (LINEAR when available).
+// ---------------------------------------------------------------------------
+const FRAG_TRAIT = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_trait;    // R32F: local evolved sensor_distance (cells), 0 = none
+uniform sampler2D u_obstacle; // wall mask (R8)
+out vec4 o;
+
+// Perceptual short→long gradient over t in [0,1]:
+//   warm amber (short reach) → teal (mid) → cool violet (long reach).
+vec3 traitPalette(float t) {
+  t = clamp(t, 0.0, 1.0);
+  vec3 c0 = vec3(0.98, 0.62, 0.18);   // amber — short-sighted
+  vec3 c1 = vec3(0.55, 0.85, 0.45);   // green
+  vec3 c2 = vec3(0.10, 0.80, 0.85);   // teal — mid reach
+  vec3 c3 = vec3(0.65, 0.35, 0.95);   // violet — long-sighted
+  if (t < 0.33) return mix(c0, c1, t / 0.33);
+  if (t < 0.66) return mix(c1, c2, (t - 0.33) / 0.33);
+  return mix(c2, c3, (t - 0.66) / 0.34);
+}
+
+void main() {
+  if (texture(u_obstacle, v_uv).r > 0.0) {
+    o = vec4(vec3(0.07, 0.09, 0.12), 1.0); // wall slate (matches tone-map)
+    return;
+  }
+  float trait = texture(u_trait, v_uv).r;
+  if (trait <= 0.0) {
+    o = vec4(0.02, 0.025, 0.04, 1.0); // no deposit / evolution off → near-black
+    return;
+  }
+  // Map the trait's clamp range [1, 32] cells onto the gradient.
+  float t = clamp((trait - 1.0) / 31.0, 0.0, 1.0);
+  o = vec4(traitPalette(t), 1.0);
+}`;
+
+// ---------------------------------------------------------------------------
 // Long-exposure accumulate — fold the current tone-mapped frame into a
 // persistent RGBA16F buffer: accum = max(accum * fade, current). The slow fade
 // keeps a fading memory of where the network has been, so its full history is
@@ -326,7 +370,7 @@ const BLUR_PASSES = 3; // number of blur iteration pairs
 // ---------------------------------------------------------------------------
 // Render modes + long-exposure
 // ---------------------------------------------------------------------------
-type RenderMode = "normal" | "components" | "long-exposure";
+type RenderMode = "normal" | "components" | "long-exposure" | "trait";
 
 const LONG_EXPOSURE_FADE = 0.985; // per-frame decay of the accumulator memory
 
@@ -375,13 +419,28 @@ function makeLabelsView(wasm: { memory: WebAssembly.Memory }, sim: Sim): Uint32A
   );
 }
 
+// The trait field is an f32-per-cell view of the local evolved sensor_distance
+// (latest-deposit-wins; 0 where evolution is off or no agent has deposited).
+// The sim writes it during tick(), so no metric call is needed to refresh it —
+// but the pointer is stable, so the view is rebuilt only on reset-class calls
+// like the field/obstacle views.
+function makeTraitView(wasm: { memory: WebAssembly.Memory }, sim: Sim): Float32Array {
+  return new Float32Array(wasm.memory.buffer, sim.trait_field_ptr(), sim.trait_field_len());
+}
+
 // Re-fetch all zero-copy views and return them. Call after every reset-class
 // op (reset / spawn / load_maze_demo / add_endpoint / clear_endpoints): WASM
 // memory may grow and detach every view, so all of them must be rebuilt.
 function refreshViews(
   wasm: { memory: WebAssembly.Memory },
   sim: Sim,
-): { trails: Float32Array[]; food: Float32Array; obstacle: Uint8Array; labels: Uint32Array } {
+): {
+  trails: Float32Array[];
+  food: Float32Array;
+  obstacle: Uint8Array;
+  labels: Uint32Array;
+  trait: Float32Array;
+} {
   const count = sim.species_count();
   const trails: Float32Array[] = [];
   for (let s = 0; s < count; s++) {
@@ -392,6 +451,7 @@ function refreshViews(
     food: makeFoodView(wasm, sim),
     obstacle: makeObstacleView(wasm, sim),
     labels: makeLabelsView(wasm, sim),
+    trait: makeTraitView(wasm, sim),
   };
 }
 
@@ -493,6 +553,17 @@ interface ChemotaxisParams {
 }
 
 // ---------------------------------------------------------------------------
+// Evolution state — per-species heritable-trait controls. `evolve` toggles
+// selection on the heritable sensor_distance; `mutation` is the per-birth
+// mutation strength (std-dev in cells of the Gaussian added to a child's
+// inherited trait).
+// ---------------------------------------------------------------------------
+interface EvolutionParams {
+  evolve: boolean;
+  mutation: number;
+}
+
+// ---------------------------------------------------------------------------
 // Network (reachability metric) state — the threshold knob.
 // ---------------------------------------------------------------------------
 interface NetworkParams {
@@ -532,6 +603,7 @@ interface PresetsState {
 //   normal        — bioluminescent tone-map + bloom (default, unchanged).
 //   components    — connected-component map (each component a distinct hue).
 //   long-exposure — time-integrated trail accumulated across frames.
+//   trait         — each cell coloured by its local evolved sensor_distance.
 // ---------------------------------------------------------------------------
 interface RenderState {
   mode: RenderMode;
@@ -559,6 +631,7 @@ function addSpeciesFolder(
   params: SimParams,
   ecology: EcologyParams,
   chemotaxis: ChemotaxisParams,
+  evolution: EvolutionParams,
 ): void {
   const folder = pane.addFolder({ title: label, expanded: false });
 
@@ -643,6 +716,22 @@ function addSpeciesFolder(
       if (suppressBindingWrites) return;
       sim.set_food_attraction(species, chemotaxis.food_attraction);
     });
+
+  // Evolution — the heritable sensor_distance trait. The toggle seeds a uniform
+  // population at the current sensor_distance and lets births mutate it; the
+  // slider sets the per-birth mutation strength (cells). Both go through the
+  // suppressBindingWrites guard so a programmatic sync doesn't perturb the sim.
+  folder.addBinding(evolution, "evolve", { label: "evolve trait" }).on("change", () => {
+    if (suppressBindingWrites) return;
+    sim.set_evolution(species, evolution.evolve);
+  });
+
+  folder
+    .addBinding(evolution, "mutation", { label: "mutation", min: 0, max: 3, step: 0.05 })
+    .on("change", () => {
+      if (suppressBindingWrites) return;
+      sim.set_mutation_strength(species, evolution.mutation);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +742,7 @@ function buildPane(
   allParams: SimParams[],
   allEcology: EcologyParams[],
   allChemotaxis: ChemotaxisParams[],
+  allEvolution: EvolutionParams[],
   crossSense: CrossSenseParams,
   network: NetworkParams,
   spawn: SpawnState,
@@ -699,8 +789,9 @@ function buildPane(
   // --- Render mode ---------------------------------------------------------
   // How the field is presented: the default bioluminescent tone-map, a
   // connected-component map (each component a distinct hue — makes the
-  // components metric visible), or a long-exposure time-integration of the
-  // network. Normal is byte-for-byte the default renderer.
+  // components metric visible), a long-exposure time-integration of the
+  // network, or a trait map (each cell coloured by its local evolved
+  // sensor_distance). Normal is byte-for-byte the default renderer.
   pane
     .addBinding(render, "mode", {
       label: "render mode",
@@ -709,6 +800,7 @@ function buildPane(
         { text: "Normal", value: "normal" },
         { text: "Component map", value: "components" },
         { text: "Long-exposure", value: "long-exposure" },
+        { text: "Trait map", value: "trait" },
       ],
     })
     .on("change", () => onRenderModeChange());
@@ -749,7 +841,16 @@ function buildPane(
   // --- Per-species parameter folders (collapsed by default) ----------------
   const speciesLabels = ["Species 0 · cyan", "Species 1 · magenta"];
   for (let s = 0; s < sim.species_count(); s++) {
-    addSpeciesFolder(pane, speciesLabels[s], sim, s, allParams[s], allEcology[s], allChemotaxis[s]);
+    addSpeciesFolder(
+      pane,
+      speciesLabels[s],
+      sim,
+      s,
+      allParams[s],
+      allEcology[s],
+      allChemotaxis[s],
+      allEvolution[s],
+    );
   }
 
   // --- Cross-species sensing -----------------------------------------------
@@ -1012,6 +1113,7 @@ async function main(): Promise<void> {
   const progComposite = compileProgram(gl, VERT, FRAG_COMPOSITE);
   const progMarker = compileProgram(gl, VERT_MARKER, FRAG_MARKER);
   const progComponents = compileProgram(gl, VERT, FRAG_COMPONENTS);
+  const progTrait = compileProgram(gl, VERT, FRAG_TRAIT);
   const progAccum = compileProgram(gl, VERT, FRAG_ACCUM);
 
   // ---------------------------------------------------------------------------
@@ -1039,6 +1141,13 @@ async function main(): Promise<void> {
   // effect of component_count().
   // ---------------------------------------------------------------------------
   const labelTex = createLabelTexture(gl, WIDTH, HEIGHT);
+
+  // ---------------------------------------------------------------------------
+  // Trait field texture (R32F) — the local evolved sensor_distance, uploaded
+  // only while the trait-map render mode is active. The sim writes the trait
+  // buffer during tick(); it's all-zero while no species is evolving.
+  // ---------------------------------------------------------------------------
+  const traitTex = createFieldTexture(gl, WIDTH, HEIGHT);
 
   // ---------------------------------------------------------------------------
   // Render mode + long-exposure accumulator bookkeeping. `accumActive` tracks
@@ -1092,6 +1201,9 @@ async function main(): Promise<void> {
   // component map
   const ulComp_labels = gl.getUniformLocation(progComponents, "u_labels");
   const ulComp_obstacle = gl.getUniformLocation(progComponents, "u_obstacle");
+  // trait map
+  const ulTrait_trait = gl.getUniformLocation(progTrait, "u_trait");
+  const ulTrait_obstacle = gl.getUniformLocation(progTrait, "u_obstacle");
   // long-exposure accumulate
   const ulAccum_prev = gl.getUniformLocation(progAccum, "u_prev");
   const ulAccum_base = gl.getUniformLocation(progAccum, "u_base");
@@ -1113,10 +1225,12 @@ async function main(): Promise<void> {
   const allParams: SimParams[] = [];
   const allEcology: EcologyParams[] = [];
   const allChemotaxis: ChemotaxisParams[] = [];
+  const allEvolution: EvolutionParams[] = [];
   for (let s = 0; s < speciesCount; s++) {
     allParams.push(readSimParams(sim, s));
     allEcology.push(readEcologyParams(sim, s));
     allChemotaxis.push({ food_attraction: sim.food_attraction(s) });
+    allEvolution.push({ evolve: sim.evolution_enabled(s), mutation: sim.mutation_strength(s) });
   }
 
   const network: NetworkParams = { network_threshold: sim.network_threshold() };
@@ -1191,6 +1305,9 @@ async function main(): Promise<void> {
       loopCount: structure.loopCount,
       fractalDimension: structure.fractalDimension,
       autocorrLength: structure.autocorrLength,
+      // Evolved-trait distribution (cheap O(agents) reductions) — per species.
+      traitMean: [sim.trait_mean(0), sim.trait_mean(1)],
+      traitStd: [sim.trait_std(0), sim.trait_std(1)],
     };
     metricsBuf.push(s);
     latestSample = s;
@@ -1226,6 +1343,8 @@ async function main(): Promise<void> {
       Object.assign(allParams[s], readSimParams(sim, s));
       Object.assign(allEcology[s], readEcologyParams(sim, s));
       allChemotaxis[s].food_attraction = sim.food_attraction(s);
+      allEvolution[s].evolve = sim.evolution_enabled(s);
+      allEvolution[s].mutation = sim.mutation_strength(s);
     }
     network.network_threshold = sim.network_threshold();
     crossSense.s01 = sim.cross_sense(0, 1);
@@ -1285,6 +1404,7 @@ async function main(): Promise<void> {
     endpoints: { x: number; y: number; radius: number }[],
     seed: number,
     crossSenseState?: CrossSense,
+    evolutionState?: { enabled: [boolean, boolean]; mutation: [number, number] },
   ): void {
     // 1. Re-seed + respawn the default population.
     seedRef.value = seed;
@@ -1340,6 +1460,17 @@ async function main(): Promise<void> {
       for (const ep of endpoints) sim.add_endpoint(ep.x, ep.y, ep.radius); // reset-class
     }
 
+    // Evolution — ALWAYS set the full per-species state (default disabled /
+    // strength 0) so switching to a scenario without evolution turns it off
+    // cleanly. Set after the geometry rebuild so enabling seeds the uniform
+    // trait population over the final agents, not a population the maze respawn
+    // would have replaced. Mutation strength is set first so it's in place when
+    // the toggle seeds the population.
+    for (let s = 0; s < speciesCount; s++) {
+      sim.set_mutation_strength(s, evolutionState?.mutation[s] ?? 0);
+      sim.set_evolution(s, evolutionState?.enabled[s] ?? false);
+    }
+
     // 4. Re-fetch every view (multiple reset-class calls above) + resync panel.
     views = refreshViews(wasm, sim);
     for (let s = 0; s < speciesCount; s++) emaRefs[s] = 1.0;
@@ -1367,6 +1498,7 @@ async function main(): Promise<void> {
       sc.endpoints,
       sc.seed ?? seedRef.value,
       sc.crossSense,
+      sc.evolution,
     );
   }
 
@@ -1375,6 +1507,7 @@ async function main(): Promise<void> {
     allParams,
     allEcology,
     allChemotaxis,
+    allEvolution,
     crossSense,
     network,
     spawn,
@@ -1416,6 +1549,7 @@ async function main(): Promise<void> {
       sharedState.endpoints,
       sharedState.seed,
       sharedState.crossSense,
+      sharedState.evolution,
     );
   }
 
@@ -1528,6 +1662,25 @@ async function main(): Promise<void> {
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, obstacleTex);
       gl.uniform1i(ulComp_obstacle, 1);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      drawMarkers = false;
+    } else if (render.mode === "trait") {
+      // --- Trait map -------------------------------------------------------
+      // Colour each cell by its local evolved sensor_distance. The sim writes
+      // the trait field during tick(), so just upload the current view and map
+      // it through the short→long gradient. A pure measurement view — no bloom,
+      // no markers. All-zero (near-black) while no species is evolving.
+      uploadField(gl, traitTex, WIDTH, HEIGHT, views.trait);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.useProgram(progTrait);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, traitTex);
+      gl.uniform1i(ulTrait_trait, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, obstacleTex);
+      gl.uniform1i(ulTrait_obstacle, 1);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       drawMarkers = false;
     } else {
