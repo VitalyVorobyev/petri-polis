@@ -3,11 +3,12 @@
 Each milestone must produce something **visually rewarding** — that's the design constraint
 that keeps a side project alive. A milestone is done only when its **gate** is met.
 
-**Status: M0–M5 (the toy) and M6 (world geography) are shipped.** The toy has the Physarum core,
-live controls, the boom/bust ecology, two coexisting species, and the inspect/measure/share
-instrument; M6 added obstacles, endpoint food sources, chemotaxis, and the reachability metric —
-the Physarum-solves-the-maze demo. It all publishes to GitHub Pages (live demo + guide + API
-docs). **M7–M11 are the remaining lab phase**, sequenced in payoff order.
+**Status: M0–M5 (the toy), M6 (world geography), and M7 (the preset gallery) are shipped.** The
+toy has the Physarum core, live controls, the boom/bust ecology, two coexisting species, and the
+inspect/measure/share instrument; M6 added obstacles, endpoint food sources, chemotaxis, and the
+reachability metric — the Physarum-solves-the-maze demo; M7 added a one-click gallery of
+classical scenarios that round-trip as shareable links. It all publishes to GitHub Pages (live
+demo + guide + API docs). **M8–M11 are the remaining lab phase**, sequenced in payoff order.
 
 **From toy to lab.** The toy proves emergence is fun and reproducible; the lab proves the toy
 *computes* — it reproduces classical complex-systems demos as one-click presets — and lets you
@@ -72,7 +73,7 @@ paint both.
 **Gate:** the network routes around a wall and connects two endpoints; the reachability readout
 flips to "connected." **This is the change that turns "pretty" into "it computes."**
 
-## M7 — Presets: the lab bench
+## M7 — Presets: the lab bench ✅ done
 Named, shareable scenarios bundling params + ecology + geometry + spawn, with a menu and a
 starter gallery of classical demos (maze, Tokyo rail, capillary mesh, trunk roads, spiral
 cells, boom/bust oscillator, competitive exclusion, coexistence). Built on the existing URL

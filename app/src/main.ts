@@ -13,6 +13,7 @@
 import { Pane } from "tweakpane";
 import { attachInspector } from "./inspector";
 import { drawSparklines, exportCSV, exportJSON, type MetricSample, MetricsBuffer } from "./metrics";
+import { DEFAULT_PRESET_ID, PRESETS, presetById, type Scenario } from "./presets";
 import {
   type BloomFBO,
   compileProgram,
@@ -23,7 +24,7 @@ import {
   uploadField,
   uploadObstacle,
 } from "./render/gl";
-import { applySharedState, decodeHash, encodeState, type SimParamObjects } from "./urlstate";
+import { decodeHash, encodeState, type GeometryTag, type SpeciesState } from "./urlstate";
 import init, { Sim } from "./wasm/petri_wasm.js";
 import wasmUrl from "./wasm/petri_wasm_bg.wasm?url";
 
@@ -406,6 +407,23 @@ interface Transport {
 }
 
 // ---------------------------------------------------------------------------
+// Presets state — the active scenario id (drives the Presets dropdown + caption).
+// ---------------------------------------------------------------------------
+interface PresetsState {
+  id: string;
+}
+
+// ---------------------------------------------------------------------------
+// Programmatic-refresh guard. When we sync the panel from the sim (after a
+// preset or shared-link load) we call `pane.refresh()`, which fires the
+// bindings' `change` events. Those handlers would otherwise write the widgets'
+// step-quantized values back into the sim, perturbing it (e.g. nudging a
+// repro_threshold of 1.12 off by a hair). The sim is authoritative during a
+// programmatic sync, so we suppress binding writes while this flag is set.
+// ---------------------------------------------------------------------------
+let suppressBindingWrites = false;
+
+// ---------------------------------------------------------------------------
 // Add per-species parameter folder to a Tweakpane container.
 // Collapsed by default so the panel isn't overwhelming at launch.
 // ---------------------------------------------------------------------------
@@ -420,43 +438,52 @@ function addSpeciesFolder(
 ): void {
   const folder = pane.addFolder({ title: label, expanded: false });
 
+  const onParams = (): void => {
+    if (suppressBindingWrites) return;
+    applySimParams(sim, species, params);
+  };
+  const onEcology = (): void => {
+    if (suppressBindingWrites) return;
+    applyEcologyParams(sim, species, ecology);
+  };
+
   // Physarum parameters
   folder
     .addBinding(params, "sensor_angle", { label: "sensor angle", min: 0, max: 1.2, step: 0.01 })
-    .on("change", () => applySimParams(sim, species, params));
+    .on("change", onParams);
 
   folder
     .addBinding(params, "sensor_distance", { label: "sensor dist", min: 1, max: 32, step: 0.5 })
-    .on("change", () => applySimParams(sim, species, params));
+    .on("change", onParams);
 
   folder
     .addBinding(params, "rotation_angle", { label: "rotation angle", min: 0, max: 1.2, step: 0.01 })
-    .on("change", () => applySimParams(sim, species, params));
+    .on("change", onParams);
 
   folder
     .addBinding(params, "step_size", { label: "step size", min: 0.2, max: 3.0, step: 0.05 })
-    .on("change", () => applySimParams(sim, species, params));
+    .on("change", onParams);
 
   folder
     .addBinding(params, "deposit", { label: "deposit", min: 0.5, max: 20, step: 0.5 })
-    .on("change", () => applySimParams(sim, species, params));
+    .on("change", onParams);
 
   folder
     .addBinding(params, "decay", { label: "decay", min: 0.8, max: 0.99, step: 0.005 })
-    .on("change", () => applySimParams(sim, species, params));
+    .on("change", onParams);
 
   folder
     .addBinding(params, "diffuse_weight", { label: "blur weight", min: 0, max: 1, step: 0.01 })
-    .on("change", () => applySimParams(sim, species, params));
+    .on("change", onParams);
 
   // Ecology parameters
   folder
     .addBinding(ecology, "metabolism", { label: "metabolism", min: 0.001, max: 0.02, step: 0.001 })
-    .on("change", () => applyEcologyParams(sim, species, ecology));
+    .on("change", onEcology);
 
   folder
     .addBinding(ecology, "eat_rate", { label: "eat rate", min: 0.02, max: 0.3, step: 0.01 })
-    .on("change", () => applyEcologyParams(sim, species, ecology));
+    .on("change", onEcology);
 
   folder
     .addBinding(ecology, "repro_threshold", {
@@ -465,7 +492,7 @@ function addSpeciesFolder(
       max: 2.5,
       step: 0.05,
     })
-    .on("change", () => applyEcologyParams(sim, species, ecology));
+    .on("change", onEcology);
 
   folder
     .addBinding(ecology, "food_regrow", {
@@ -474,11 +501,11 @@ function addSpeciesFolder(
       max: 0.02,
       step: 0.0005,
     })
-    .on("change", () => applyEcologyParams(sim, species, ecology));
+    .on("change", onEcology);
 
   folder
     .addBinding(ecology, "death_return", { label: "death return", min: 0, max: 1, step: 0.05 })
-    .on("change", () => applyEcologyParams(sim, species, ecology));
+    .on("change", onEcology);
 
   // Chemotaxis — steers agents up the food gradient toward endpoints.
   folder
@@ -488,7 +515,10 @@ function addSpeciesFolder(
       max: 10,
       step: 0.1,
     })
-    .on("change", () => sim.set_food_attraction(species, chemotaxis.food_attraction));
+    .on("change", () => {
+      if (suppressBindingWrites) return;
+      sim.set_food_attraction(species, chemotaxis.food_attraction);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -503,12 +533,16 @@ function buildPane(
   spawn: SpawnState,
   geometry: GeometryState,
   transport: Transport,
+  presets: PresetsState,
   onReset: () => void,
   onLoadMaze: () => void,
   onClearGeometry: () => void,
+  onApplyPreset: (id: string) => void,
   seedRef: { value: number },
   metricsBuf: MetricsBuffer,
   paneRef: { pane: Pane | null },
+  captionRef: { value: string },
+  geometryTagRef: { value: GeometryTag },
 ): void {
   const pane = new Pane({ title: "Petri Polis" });
   paneRef.pane = pane;
@@ -533,6 +567,27 @@ function buildPane(
       { text: "5×", value: 5 },
       { text: "10×", value: 10 },
     ],
+  });
+
+  // --- Presets (the lab bench) ---------------------------------------------
+  // A menu of named classical complex-systems scenarios. Selecting one applies
+  // it immediately (full reset to its canonical state). The caption monitor
+  // names the active scenario.
+  const presetsFolder = pane.addFolder({ title: "Presets", expanded: true });
+
+  presetsFolder
+    .addBinding(presets, "id", {
+      label: "scenario",
+      view: "list",
+      options: PRESETS.map((p) => ({ text: p.name, value: p.id })),
+    })
+    .on("change", (ev) => onApplyPreset(ev.value));
+
+  presetsFolder.addBinding(captionRef, "value", {
+    label: "about",
+    readonly: true,
+    multiline: true,
+    rows: 2,
   });
 
   // --- Reset ---------------------------------------------------------------
@@ -594,7 +649,10 @@ function buildPane(
       max: 1,
       step: 0.005,
     })
-    .on("change", () => sim.set_network_threshold(network.network_threshold));
+    .on("change", () => {
+      if (suppressBindingWrites) return;
+      sim.set_network_threshold(network.network_threshold);
+    });
 
   // --- Spawn ---------------------------------------------------------------
   const spawnFolder = pane.addFolder({ title: "Spawn (click canvas)", expanded: false });
@@ -637,7 +695,11 @@ function buildPane(
   });
 
   metricsFolder.addButton({ title: "Copy link" }).on("click", () => {
-    const hash = encodeState(sim, seedRef.value);
+    // Capture the full scenario: seed + per-species params/ecology/chemotaxis +
+    // reachability threshold + endpoints + the built-in geometry tag (the maze's
+    // wall mask is regenerated from the tag on load; hand-painted walls are not
+    // serialized, by design).
+    const hash = encodeState(sim, seedRef.value, geometryTagRef.value);
     location.hash = hash;
     navigator.clipboard.writeText(location.href).catch(() => {
       // clipboard may be unavailable (non-HTTPS); at least the hash is set
@@ -853,6 +915,13 @@ async function main(): Promise<void> {
   const transport: Transport = { paused: false, speed: 1, stepOnce: false };
   const seedRef = { value: initialSeed };
 
+  // Active preset + its caption, and the built-in geometry tag of the current
+  // scenario (what a share link regenerates: "maze" → load_maze_demo; "none" →
+  // open world). Hand-painting walls is intentionally NOT reflected in this tag.
+  const presets: PresetsState = { id: DEFAULT_PRESET_ID };
+  const captionRef = { value: presetById(DEFAULT_PRESET_ID)?.caption ?? "" };
+  const geometryTagRef: { value: GeometryTag } = { value: "none" };
+
   // ---------------------------------------------------------------------------
   // Metrics ring buffer + food ceiling (captured on reset)
   // ---------------------------------------------------------------------------
@@ -894,22 +963,36 @@ async function main(): Promise<void> {
     latestSample = null;
   }
 
+  // Sync the mutable param objects + Tweakpane from the sim's current state.
+  // Called after any reset-class op so the panel mirrors the live sim. The
+  // refresh fires binding `change` events; we suppress their writes so the
+  // step-quantized widget values don't get pushed back into the authoritative
+  // sim state.
+  function syncPanelFromSim(): void {
+    for (let s = 0; s < speciesCount; s++) {
+      Object.assign(allParams[s], readSimParams(sim, s));
+      Object.assign(allEcology[s], readEcologyParams(sim, s));
+      allChemotaxis[s].food_attraction = sim.food_attraction(s);
+    }
+    network.network_threshold = sim.network_threshold();
+    suppressBindingWrites = true;
+    paneRef.pane?.refresh();
+    suppressBindingWrites = false;
+  }
+
   // Load the built-in maze scenario — reset-class (rewrites obstacles,
   // endpoints, food, population), so re-fetch all views. Sync the param panel
   // since food-attraction is turned on by the demo.
   function doLoadMaze(): void {
     sim.load_maze_demo();
+    geometryTagRef.value = "maze";
     views = refreshViews(wasm, sim);
-    for (let s = 0; s < speciesCount; s++) {
-      emaRefs[s] = 1.0;
-      allChemotaxis[s].food_attraction = sim.food_attraction(s);
-    }
-    network.network_threshold = sim.network_threshold();
+    for (let s = 0; s < speciesCount; s++) emaRefs[s] = 1.0;
     emaFoodRef = 1.0;
     metricsBuf.clear();
     metricsBuf.foodCeiling = sim.food_total();
     latestSample = null;
-    paneRef.pane?.refresh();
+    syncPanelFromSim();
   }
 
   // Clear walls + endpoints. clear_obstacles is in-place; clear_endpoints is
@@ -917,8 +1000,99 @@ async function main(): Promise<void> {
   function doClearGeometry(): void {
     sim.clear_obstacles();
     sim.clear_endpoints();
+    geometryTagRef.value = "none";
     views = refreshViews(wasm, sim);
     metricsBuf.foodCeiling = sim.food_total();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Apply a full scenario — the shared path for both presets and shared links.
+  // Fully resets the world to the scenario's canonical state, in order:
+  //   1. reset(seed)  — re-seed + respawn the default population (reset-class).
+  //   2. per-species params / ecology / chemotaxis + network threshold (scalar
+  //      setters; no re-fetch needed).
+  //   3. rebuild geometry: clear_obstacles + clear_endpoints (so switching off
+  //      the maze removes its walls), then either load_maze_demo (tag "maze")
+  //      or add_endpoint(...) per the endpoint list, or nothing.
+  //   4. re-fetch ALL zero-copy views (every reset-class call above may have
+  //      grown/detached the views) and refresh the Tweakpane bindings.
+  // ---------------------------------------------------------------------------
+  function applyScenario(
+    species: SpeciesState[],
+    networkThreshold: number,
+    geometryTag: GeometryTag,
+    endpoints: { x: number; y: number; radius: number }[],
+    seed: number,
+  ): void {
+    // 1. Re-seed + respawn the default population.
+    seedRef.value = seed;
+    sim.reset(seed);
+
+    // 2. Per-species params, ecology, chemotaxis + reachability threshold.
+    const n = Math.min(species.length, speciesCount);
+    for (let s = 0; s < n; s++) {
+      const sp = species[s];
+      sim.set_params(
+        s,
+        sp.sensor_angle,
+        sp.sensor_distance,
+        sp.rotation_angle,
+        sp.step_size,
+        sp.deposit,
+        sp.decay,
+      );
+      sim.set_diffuse_weight(s, sp.diffuse_weight);
+      sim.set_ecology(
+        s,
+        sp.metabolism,
+        sp.eat_rate,
+        sp.repro_threshold,
+        sp.food_regrow,
+        sp.death_return,
+      );
+      sim.set_food_attraction(s, sp.food_attraction);
+    }
+    sim.set_network_threshold(networkThreshold);
+
+    // 3. Geometry. Always clear first so switching presets removes prior walls
+    //    and endpoints, then lay down the scenario's built-in geometry.
+    sim.clear_obstacles(); // in-place
+    sim.clear_endpoints(); // reset-class
+    if (geometryTag === "maze") {
+      // The maze bakes in its own walls, endpoints, chemotaxis, and population —
+      // it overrides whatever we set above, which is intentional.
+      sim.load_maze_demo();
+      geometryTagRef.value = "maze";
+    } else {
+      geometryTagRef.value = "none";
+      for (const ep of endpoints) sim.add_endpoint(ep.x, ep.y, ep.radius); // reset-class
+    }
+
+    // 4. Re-fetch every view (multiple reset-class calls above) + resync panel.
+    views = refreshViews(wasm, sim);
+    for (let s = 0; s < speciesCount; s++) emaRefs[s] = 1.0;
+    emaFoodRef = 1.0;
+    metricsBuf.clear();
+    metricsBuf.foodCeiling = sim.food_total();
+    latestSample = null;
+    syncPanelFromSim();
+  }
+
+  // Apply a preset by id (from the Presets dropdown). Pins the preset's seed if
+  // it has one, otherwise keeps the current seed.
+  function doApplyPreset(id: string): void {
+    const preset = presetById(id);
+    if (!preset) return;
+    const sc: Scenario = preset.scenario;
+    presets.id = id;
+    captionRef.value = preset.caption;
+    applyScenario(
+      sc.species,
+      sc.network_threshold,
+      sc.geometry,
+      sc.endpoints,
+      sc.seed ?? seedRef.value,
+    );
   }
 
   buildPane(
@@ -930,23 +1104,36 @@ async function main(): Promise<void> {
     spawn,
     geometry,
     transport,
+    presets,
     doReset,
     doLoadMaze,
     doClearGeometry,
+    doApplyPreset,
     seedRef,
     metricsBuf,
     paneRef,
+    captionRef,
+    geometryTagRef,
   );
 
   // ---------------------------------------------------------------------------
-  // Apply shared state from URL hash (after pane is built so we can refresh it)
+  // Apply shared state from URL hash (after pane is built so we can refresh it).
+  // A shared link is a full scenario, applied through the same path presets use:
+  // params/ecology/chemotaxis → threshold → geometry (maze tag → load_maze_demo,
+  // else the endpoint list) → re-fetch views → refresh pane.
   // ---------------------------------------------------------------------------
   if (sharedState) {
-    const paramObjects: SimParamObjects = { allParams, allEcology };
-    applySharedState(sim, sharedState, paramObjects);
-    // Re-read food ceiling now that seed is applied.
-    metricsBuf.foodCeiling = sim.food_total();
-    paneRef.pane?.refresh();
+    // A URL-loaded scenario is not necessarily a named preset; set a neutral
+    // dropdown selection + caption before applying so the sync picks them up.
+    presets.id = DEFAULT_PRESET_ID;
+    captionRef.value = "Loaded from a shared link.";
+    applyScenario(
+      sharedState.species,
+      sharedState.network_threshold,
+      sharedState.geometry,
+      sharedState.endpoints,
+      sharedState.seed,
+    );
   }
 
   attachCanvasHandler(canvas, sim, spawn, geometry, () => {

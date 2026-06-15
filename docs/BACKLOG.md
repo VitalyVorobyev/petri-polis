@@ -94,11 +94,12 @@ The next-task queue. Open this first each session, do the top unchecked item, ti
 - [x] **Gate check:** verified (native `maze_demo_connects_the_endpoints` reaches `2/2`; in-browser `load_maze_demo` + 10× spans both wells, zero console errors). The colony connects via pre-grown coverage, then the food-starved interior thins and it settles at `1/2` — a *persistent, pruned* shortest-path tube needs an adaptive flux-based model, not tuning (follow-up below)
 - [ ] follow-up (deferred milestone): a *persistent, pruned* shortest-path maze solve — the full "Physarum solves the maze" result. A diffusing long-range chemoattractant was tried and reverted: it yields either a transient connection or, with enough trail persistence to hold, a saturated blanket (~95% of open cells) — not a thin pruned tube. The real result needs an adaptive **flux-based tube model** (Tero-style: edges strengthen with throughput, unused edges decay), not tuning. Deliberate future work.
 
-## M7 — Presets: the lab bench (gate: pick a preset → canonical structure in seconds; presets share as links)
-- [ ] petri-core/petri-wasm: scenario serialization — params + ecology + geometry (walls/endpoints/food) + spawn, round-trippable through the boundary
-- [ ] app: preset menu in Tweakpane + a starter gallery (maze, Tokyo rail, capillary mesh, trunk roads, spiral cells, boom/bust oscillator, competitive exclusion, coexistence)
-- [ ] app: extend the URL codec to carry geometry so a preset round-trips as a shareable link
-- [ ] **Gate check:** each gallery preset loads its canonical structure; a shared link reproduces it
+## M7 — Presets: the lab bench ✅ gate met — every gallery preset loads its canonical structure; scenarios round-trip as links
+- [x] app: scenario model in TS (`presets.ts`) — seed + per-species params/ecology + chemotaxis + geometry + spawn; applied through the existing live setters (no new sim/wasm needed — the M6 boundary already exposes everything)
+- [x] app: Presets Tweakpane folder + `applyScenario` (reset → setters → clear+rebuild geometry → re-fetch all views → guarded panel refresh); fixed a `pane.refresh()` bug that fired binding writes and perturbed the sim
+- [x] app: starter gallery (coexistence, competitive exclusion, capillary mesh, trunk roads, spirals, boom/bust oscillator, maze via `load_maze_demo`, Tokyo rail via 9 city endpoints)
+- [x] app: URL codec (`urlstate.ts`) carries the full scenario — params + ecology + `food_attraction` + `network_threshold` + the endpoint list + a built-in geometry tag (`maze`); hand-painted masks intentionally not serialized
+- [x] **Gate check:** verified in-browser — all 8 presets apply with distinct canonical structures, zero console errors; Tokyo / maze / competitive-exclusion links round-trip exactly
 
 ## M8 — Cross-species sensing (gate: territories / a chase neither species makes alone; deterministic)
 - [ ] petri-core: a 2×2 signed sensing-weight matrix — each species senses the other's field with an attract/avoid weight; default 0 keeps current behavior byte-identical
