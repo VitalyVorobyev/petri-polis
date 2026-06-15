@@ -86,9 +86,11 @@ When the demo loads, the blanketed colony spans the whole maze at once, so `endp
 reads `2` from the first ticks. Then, with food only at the two wells and chemotaxis acting only
 within sensor range, the starved interior of the maze thins and the connecting trail contracts back
 toward the wells — `network_cost` falls and the metric reads out how much of the bridge through the
-gaps survives. (Sustaining a *persistent* tube along the shortest route — the part of the
-laboratory result where the mold prunes to a single path — needs a longer-range attractant than
-local sensing provides; that is a natural next step for the lab.)
+gaps survives. (Sustaining a *persistent* tube pruned to the shortest route — the part of the
+laboratory result where the mold thins to a single path — is not reachable by tuning this
+trail-and-chemotaxis model alone: a longer-range attractant strong enough to hold the connection
+just blankets the maze. The real result needs an adaptive, flux-based tube model, where edges
+strengthen with throughput and unused ones decay. That is a deliberate next step for the lab.)
 
 ## The maze demo
 
