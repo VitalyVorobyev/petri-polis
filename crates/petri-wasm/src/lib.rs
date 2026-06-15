@@ -390,6 +390,24 @@ impl Sim {
         self.inner.params(species as usize).food_attraction
     }
 
+    /// Set the cross-species sensing weight `cross_sense[species][other]` — how
+    /// strongly an agent of `species` is pulled by `other`'s trail at a sensor. A
+    /// positive weight attracts it to the other species' trail, a negative one repels
+    /// it. The diagonal (`species == other`) is the agent's own-trail weight (default
+    /// `1.0`); off-diagonals default to `0.0` (no coupling). Takes effect next tick; no
+    /// rebuild. While the matrix is the default identity, the sim runs the byte-identical
+    /// own-trail fast path.
+    pub fn set_cross_sense(&mut self, species: u32, other: u32, weight: f32) {
+        self.inner
+            .set_cross_sense(species as usize, other as usize, weight);
+    }
+
+    /// Current cross-species sensing weight `cross_sense[species][other]` (for the
+    /// parameter panel). Out-of-range indices return `0.0`.
+    pub fn cross_sense(&self, species: u32, other: u32) -> f32 {
+        self.inner.cross_sense(species as usize, other as usize)
+    }
+
     /// Set the reachability threshold — the fraction of the current combined
     /// `field_max` a cell's combined trail must reach to count as network. Clamped to
     /// `[0, 1]`. Affects only the on-demand metric, not the sim.

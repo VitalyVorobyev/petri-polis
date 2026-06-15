@@ -11,17 +11,20 @@
 // SharedState shape the share-link codec round-trips, so every preset is
 // shareable as a URL.
 
-import type { Endpoint, GeometryTag, SpeciesState } from "./urlstate";
+import type { CrossSense, Endpoint, GeometryTag, SpeciesState } from "./urlstate";
 
 // A preset's scenario: everything `applyScenario` needs. `seed` is optional —
 // when omitted, applying the preset keeps the current seed (only param/geometry
-// presets care to stay reproducible without pinning a seed).
+// presets care to stay reproducible without pinning a seed). `crossSense` is
+// optional too — omitted means identity coupling (off-diagonals 0), so a preset
+// without it resets any cross-species coupling left by the previous scenario.
 export interface Scenario {
   seed?: number;
   species: SpeciesState[];
   network_threshold: number;
   geometry: GeometryTag;
   endpoints: Endpoint[];
+  crossSense?: CrossSense;
 }
 
 export interface Preset {
@@ -222,6 +225,35 @@ export const PRESETS: Preset[] = [
       network_threshold: DEFAULT_THRESHOLD,
       geometry: "none",
       endpoints: tokyoEndpoints(),
+    },
+  },
+  {
+    id: "territories",
+    name: "Territories",
+    caption: "Mutual avoidance — each species shuns the other's trail, carving separate domains.",
+    scenario: {
+      // Symmetric repulsion: each species is pushed away from the other's
+      // trail, so they segregate into separate regions with a contested seam.
+      species: [s0(), s1()],
+      network_threshold: DEFAULT_THRESHOLD,
+      geometry: "none",
+      endpoints: [],
+      crossSense: { s01: -0.6, s10: -0.6 },
+    },
+  },
+  {
+    id: "predator-prey",
+    name: "Predator/prey",
+    caption: "Magenta hunts cyan's trail while cyan flees — a chase front sweeps the field.",
+    scenario: {
+      // Asymmetric coupling: predator magenta (s10 > 0) is drawn up prey cyan's
+      // trail; prey cyan (s01 < 0) is repelled by the predator's trail and runs.
+      // Slightly faster, slower-fading trails make the chase read more clearly.
+      species: [s0({ step_size: 1.2, decay: 0.9 }), s1({ step_size: 1.4, decay: 0.92 })],
+      network_threshold: DEFAULT_THRESHOLD,
+      geometry: "none",
+      endpoints: [],
+      crossSense: { s01: -0.8, s10: 0.8 },
     },
   },
 ];

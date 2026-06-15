@@ -110,12 +110,15 @@ boom/bust that recovers rather than going extinct.
 ## Two species (implementable spec for petri-core)
 
 `SPECIES = 2`. Each species owns a trail field, a `Params` set, and an `Ecology` set; every
-agent carries a `species` tag. An agent senses and deposits **only its own species' trail**, so
-each species self-organizes its own network. The **only** coupling is the shared `food` field —
-both eat from the same regrowing patches, competing spatially at their network boundaries. The
-two default sets are tuned to different niches (species 0 a fine, fast mesh; species 1 coarse,
-thick veins) so they coexist instead of one excluding the other. Per-species live params via
-`set_params(species, …)` / `set_ecology(species, …)`.
+agent carries a `species` tag. An agent deposits **only into its own species' trail**, and by
+default senses only its own trail, so each species self-organizes its own network. By default the
+**only** coupling is the shared `food` field — both eat from the same regrowing patches,
+competing spatially at their network boundaries. The two default sets are tuned to different
+niches (species 0 a fine, fast mesh; species 1 coarse, thick veins) so they coexist instead of
+one excluding the other. Per-species live params via `set_params(species, …)` /
+`set_ecology(species, …)`. An optional signed **2×2 cross-sensing matrix** (default identity)
+lets a species also read the other's trail — positive weight to chase it, negative to avoid it —
+which adds territories and predator/prey on top of the shared-food coupling.
 
 ## World geography (sources, sinks & obstacles)
 
@@ -226,14 +229,24 @@ population. Patchy food (not uniform) is chosen so survivors in rich patches dri
 instead of global extinction, and the cycle is spatially staggered — more legible and more
 beautiful.
 
-**D10 — Two species coupled only through shared food (own-trail niche partitioning).**
-Each species senses/deposits only its own trail field and differs by parameter-set + color; the
-sole interaction is competition for the one shared food field. Because each follows its own
-trail, the species self-segregate into interwoven networks → robust coexistence and a legible
-two-color picture. *Rejected:* a Forager→Seeder→Builder role-transition pipeline (a new
-lifecycle mechanic, harder to keep deterministic and legible) and direct cross-species trail
-sensing (predator/prey) — both add coupling the gate doesn't need yet. Start at two; the
-`SPECIES` constant generalizes when a third earns its place.
+**D10 — Two species, coupled through shared food by default (own-trail niche partitioning).**
+Each species deposits only into its own trail field and differs by parameter-set + color; by
+default the interaction is competition for the one shared food field. Because each follows its
+own trail, the species self-segregate into interwoven networks → robust coexistence and a legible
+two-color picture. *Rejected:* a Forager→Seeder→Builder role-transition pipeline (a new lifecycle
+mechanic, harder to keep deterministic and legible). Start at two; the `SPECIES` constant
+generalizes when a third earns its place. (Direct cross-species trail sensing, once out of scope,
+is now an opt-in matrix — see D15.)
+
+**D15 — Cross-species coupling is an opt-in signed sensing matrix, off by default.**
+Each species can read the other's trail through a 2×2 weight matrix (positive = attract toward
+it, negative = avoid it); the default is the identity matrix, so an out-of-the-box run is
+byte-identical and the only coupling is still shared food. A few lines of weighted-sum arithmetic
+in the sense step buy territories (mutual avoidance) and predator/prey (asymmetric pursuit), and
+the effect is measurable (trail overlap drops sharply under mutual avoidance). *Rejected:*
+hard-wiring a predator/prey rule (the signed matrix subsumes it and stays tunable); making
+cross-sensing always-on (it would change the default dynamics and tax every sense for a feature
+most runs leave off).
 
 **D11 — World geography is additive and inert by default (obstacles + chemotaxis).** A `u8` wall
 mask (held at 0 under walls, sensed as 0, refusing moves) plus a per-species `food_attraction`

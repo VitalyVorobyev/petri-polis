@@ -24,7 +24,13 @@ import {
   uploadField,
   uploadObstacle,
 } from "./render/gl";
-import { decodeHash, encodeState, type GeometryTag, type SpeciesState } from "./urlstate";
+import {
+  type CrossSense,
+  decodeHash,
+  encodeState,
+  type GeometryTag,
+  type SpeciesState,
+} from "./urlstate";
 import init, { Sim } from "./wasm/petri_wasm.js";
 import wasmUrl from "./wasm/petri_wasm_bg.wasm?url";
 
@@ -398,6 +404,18 @@ interface NetworkParams {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-species sensing state — the two off-diagonal coupling weights.
+//   s01 = species 0 (cyan) senses species 1's (magenta) trail.
+//   s10 = species 1 (magenta) senses species 0's (cyan) trail.
+// Positive = attracted to the other's trail, negative = repelled. The own-trail
+// diagonals stay at 1.0 and aren't exposed.
+// ---------------------------------------------------------------------------
+interface CrossSenseParams {
+  s01: number;
+  s10: number;
+}
+
+// ---------------------------------------------------------------------------
 // Transport state
 // ---------------------------------------------------------------------------
 interface Transport {
@@ -529,6 +547,7 @@ function buildPane(
   allParams: SimParams[],
   allEcology: EcologyParams[],
   allChemotaxis: ChemotaxisParams[],
+  crossSense: CrossSenseParams,
   network: NetworkParams,
   spawn: SpawnState,
   geometry: GeometryState,
@@ -607,6 +626,36 @@ function buildPane(
   for (let s = 0; s < sim.species_count(); s++) {
     addSpeciesFolder(pane, speciesLabels[s], sim, s, allParams[s], allEcology[s], allChemotaxis[s]);
   }
+
+  // --- Cross-species sensing -----------------------------------------------
+  // The two off-diagonal coupling weights: how strongly each species is pulled
+  // by the OTHER's trail. Positive = attracted, negative = repelled. The
+  // own-trail diagonals stay at 1.0 and aren't exposed.
+  const crossFolder = pane.addFolder({ title: "Cross-species sensing", expanded: false });
+
+  crossFolder
+    .addBinding(crossSense, "s01", {
+      label: "cyan senses magenta",
+      min: -1,
+      max: 1,
+      step: 0.05,
+    })
+    .on("change", () => {
+      if (suppressBindingWrites) return;
+      sim.set_cross_sense(0, 1, crossSense.s01);
+    });
+
+  crossFolder
+    .addBinding(crossSense, "s10", {
+      label: "magenta senses cyan",
+      min: -1,
+      max: 1,
+      step: 0.05,
+    })
+    .on("change", () => {
+      if (suppressBindingWrites) return;
+      sim.set_cross_sense(1, 0, crossSense.s10);
+    });
 
   // --- Geometry (walls + endpoints) ----------------------------------------
   const geomFolder = pane.addFolder({ title: "Geometry (click canvas)", expanded: false });
@@ -910,6 +959,10 @@ async function main(): Promise<void> {
   }
 
   const network: NetworkParams = { network_threshold: sim.network_threshold() };
+  const crossSense: CrossSenseParams = {
+    s01: sim.cross_sense(0, 1),
+    s10: sim.cross_sense(1, 0),
+  };
   const spawn: SpawnState = { count: 500, pattern: 1, species: 0 };
   const geometry: GeometryState = { tool: "spawn", brushRadius: 6, endpointRadius: 8 };
   const transport: Transport = { paused: false, speed: 1, stepOnce: false };
@@ -975,6 +1028,8 @@ async function main(): Promise<void> {
       allChemotaxis[s].food_attraction = sim.food_attraction(s);
     }
     network.network_threshold = sim.network_threshold();
+    crossSense.s01 = sim.cross_sense(0, 1);
+    crossSense.s10 = sim.cross_sense(1, 0);
     suppressBindingWrites = true;
     paneRef.pane?.refresh();
     suppressBindingWrites = false;
@@ -1009,13 +1064,17 @@ async function main(): Promise<void> {
   // Apply a full scenario — the shared path for both presets and shared links.
   // Fully resets the world to the scenario's canonical state, in order:
   //   1. reset(seed)  — re-seed + respawn the default population (reset-class).
-  //   2. per-species params / ecology / chemotaxis + network threshold (scalar
-  //      setters; no re-fetch needed).
+  //   2. per-species params / ecology / chemotaxis + network threshold +
+  //      cross-species sensing (scalar setters; no re-fetch needed).
   //   3. rebuild geometry: clear_obstacles + clear_endpoints (so switching off
   //      the maze removes its walls), then either load_maze_demo (tag "maze")
   //      or add_endpoint(...) per the endpoint list, or nothing.
   //   4. re-fetch ALL zero-copy views (every reset-class call above may have
   //      grown/detached the views) and refresh the Tweakpane bindings.
+  // The cross-sense matrix is ALWAYS set in full (off-diagonals default to 0,
+  // diagonals pinned to 1), so switching to a scenario without coupling clears
+  // any coupling left by the previous one — no stale coupling leaks between
+  // presets.
   // ---------------------------------------------------------------------------
   function applyScenario(
     species: SpeciesState[],
@@ -1023,6 +1082,7 @@ async function main(): Promise<void> {
     geometryTag: GeometryTag,
     endpoints: { x: number; y: number; radius: number }[],
     seed: number,
+    crossSenseState?: CrossSense,
   ): void {
     // 1. Re-seed + respawn the default population.
     seedRef.value = seed;
@@ -1053,6 +1113,16 @@ async function main(): Promise<void> {
       sim.set_food_attraction(s, sp.food_attraction);
     }
     sim.set_network_threshold(networkThreshold);
+
+    // Cross-species sensing — always set the full matrix so switching to a
+    // scenario without coupling resets it to identity (own-trail diagonals at
+    // 1.0, cross off-diagonals at 0.0). The diagonals are pinned to 1 here to
+    // guard against any stale own-trail weight; the off-diagonals carry the
+    // scenario's coupling (0 when omitted).
+    sim.set_cross_sense(0, 0, 1.0);
+    sim.set_cross_sense(1, 1, 1.0);
+    sim.set_cross_sense(0, 1, crossSenseState?.s01 ?? 0);
+    sim.set_cross_sense(1, 0, crossSenseState?.s10 ?? 0);
 
     // 3. Geometry. Always clear first so switching presets removes prior walls
     //    and endpoints, then lay down the scenario's built-in geometry.
@@ -1092,6 +1162,7 @@ async function main(): Promise<void> {
       sc.geometry,
       sc.endpoints,
       sc.seed ?? seedRef.value,
+      sc.crossSense,
     );
   }
 
@@ -1100,6 +1171,7 @@ async function main(): Promise<void> {
     allParams,
     allEcology,
     allChemotaxis,
+    crossSense,
     network,
     spawn,
     geometry,
@@ -1133,6 +1205,7 @@ async function main(): Promise<void> {
       sharedState.geometry,
       sharedState.endpoints,
       sharedState.seed,
+      sharedState.crossSense,
     );
   }
 
