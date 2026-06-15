@@ -301,6 +301,18 @@ impl SpawnPattern {
     }
 }
 
+/// The default cross-sensing matrix: identity (each species senses only its own
+/// trail with weight 1). A run under this matrix is bit-for-bit the pre-existing rule.
+fn identity_cross_sense() -> [[f32; SPECIES]; SPECIES] {
+    let mut m = [[0.0f32; SPECIES]; SPECIES];
+    let mut s = 0;
+    while s < SPECIES {
+        m[s][s] = 1.0;
+        s += 1;
+    }
+    m
+}
+
 /// The simulation world. Owns one trail `field` per species (each row-major,
 /// `width * height`) that the renderer visualises, the shared `food` field both
 /// species draw from, the struct-of-arrays agent population (tagged by species),
@@ -369,6 +381,15 @@ pub struct Sim {
     params: [Params; SPECIES],
     ecology: [Ecology; SPECIES],
 
+    /// Signed cross-species sensing weights: `cross_sense[s][o]` is how strongly an
+    /// agent of species `s` is pulled by species `o`'s trail when sampling a sensor.
+    /// The trail value an agent of species `s` reads at a sensor cell is
+    /// `Σ_o cross_sense[s][o] * field[o][cell]` — a positive off-diagonal attracts it
+    /// to the other species' trail, a negative one repels it. The default is the
+    /// identity (each species senses only its own trail with weight 1), which is the
+    /// exact pre-existing rule and stays bit-for-bit identical.
+    cross_sense: [[f32; SPECIES]; SPECIES],
+
     /// Reachability threshold as a fraction of the current combined `field_max`.
     /// Live-tunable; defaults to [`DEFAULT_NETWORK_THRESHOLD`].
     network_threshold: f32,
@@ -422,6 +443,7 @@ impl Sim {
             rng: Rng::seed(seed),
             params,
             ecology,
+            cross_sense: identity_cross_sense(),
             network_threshold: DEFAULT_NETWORK_THRESHOLD,
             visited: vec![0u32; cells],
             bfs_queue: vec![0u32; cells],
@@ -532,6 +554,43 @@ impl Sim {
     /// next [`Sim::tick`]; no reallocation, no rebuild.
     pub fn set_ecology(&mut self, s: usize, ecology: Ecology) {
         self.ecology[s] = ecology;
+    }
+
+    /// Current cross-sensing weight `cross_sense[species][other]` — how strongly an
+    /// agent of `species` is pulled by `other`'s trail at a sensor. Out-of-range
+    /// indices return `0.0`.
+    pub fn cross_sense(&self, species: usize, other: usize) -> f32 {
+        if species < SPECIES && other < SPECIES {
+            self.cross_sense[species][other]
+        } else {
+            0.0
+        }
+    }
+
+    /// Set the cross-sensing weight `cross_sense[species][other]`. Positive = the
+    /// agent is attracted to `other`'s trail, negative = repelled. Takes effect on the
+    /// next [`Sim::tick`]; no reallocation, no rebuild. Out-of-range indices are ignored.
+    pub fn set_cross_sense(&mut self, species: usize, other: usize, weight: f32) {
+        if species < SPECIES && other < SPECIES {
+            self.cross_sense[species][other] = weight;
+        }
+    }
+
+    /// Whether the cross-sensing matrix differs from the identity. When `false` (the
+    /// default), the sense path uses the single-field fast path and a run is
+    /// bit-for-bit identical to the pre-existing rule. Any off-diagonal `!= 0.0` or
+    /// any diagonal `!= 1.0` flips this on.
+    #[inline]
+    fn cross_sense_active(&self) -> bool {
+        for s in 0..SPECIES {
+            for o in 0..SPECIES {
+                let expected = if s == o { 1.0 } else { 0.0 };
+                if self.cross_sense[s][o] != expected {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     // --- Read-only inspection: point queries and per-agent getters. These never
@@ -652,6 +711,9 @@ impl Sim {
             self.obstacle_count = 0;
         }
         self.endpoints.clear();
+        // Cross-sensing is world state: a fresh world senses only own trails, so
+        // restoring the identity keeps `reset` byte-identical to a fresh `new`.
+        self.cross_sense = identity_cross_sense();
         self.x.clear();
         self.y.clear();
         self.heading.clear();
@@ -1331,9 +1393,12 @@ impl Sim {
         let w = self.width as f32;
         let h = self.height as f32;
         let n = self.x.len();
-        // Geometry fast-path flags: when both are off, every branch below collapses
-        // to exactly today's arithmetic and RNG draw order (byte-identity guard).
+        // Geometry / cross-sensing fast-path flags: when all are off, every branch
+        // below collapses to exactly today's arithmetic and RNG draw order
+        // (byte-identity guard). `cross` is a whole-tick constant — the matrix can't
+        // change mid-pass — so hoist it out of the per-agent loop.
         let has_walls = self.obstacle_count != 0;
+        let cross = self.cross_sense_active();
 
         // --- Phase 1: sense → steer → move → eat → deposit, pay metabolism. ---
         for i in 0..n {
@@ -1349,12 +1414,36 @@ impl Sim {
             //    reads 0 (no trail). With food-attraction on, each reading gains
             //    `food_attraction * food` at the sensor (steer up the food gradient).
             let attract = p.food_attraction;
-            let (f, l, r) = if !has_walls && attract == 0.0 {
+            let (f, l, r) = if !has_walls && attract == 0.0 && !cross {
                 // Default path — bit-for-bit identical to the pre-geography rule.
                 (
                     self.sense(s, cx, cy, heading, p.sensor_distance),
                     self.sense(s, cx, cy, heading - p.sensor_angle, p.sensor_distance),
                     self.sense(s, cx, cy, heading + p.sensor_angle, p.sensor_distance),
+                )
+            } else if cross {
+                // Cross-sensing path: each sensor reads the weighted sum of every
+                // species' trail (the signed `cross_sense` row), plus the food term.
+                (
+                    self.sense_cross(s, cx, cy, heading, p.sensor_distance, attract, has_walls),
+                    self.sense_cross(
+                        s,
+                        cx,
+                        cy,
+                        heading - p.sensor_angle,
+                        p.sensor_distance,
+                        attract,
+                        has_walls,
+                    ),
+                    self.sense_cross(
+                        s,
+                        cx,
+                        cy,
+                        heading + p.sensor_angle,
+                        p.sensor_distance,
+                        attract,
+                        has_walls,
+                    ),
                 )
             } else {
                 (
@@ -1542,6 +1631,45 @@ impl Sim {
             return 0.0;
         }
         let trail = self.field[s][idx];
+        if attract != 0.0 {
+            trail + attract * self.food[idx]
+        } else {
+            trail
+        }
+    }
+
+    /// Geography- and cross-species-aware sensor for species `s`. Samples the cell
+    /// `distance` ahead along `angle`. A wall cell (when `has_walls`) reads `0` (masked
+    /// geography — neither trail nor food). Otherwise the reading is the weighted sum of
+    /// every species' trail at that cell, `Σ_o cross_sense[s][o] * field[o][cell]`, plus
+    /// the food-attraction term `attract * food[cell]` (when `attract != 0`). Used only
+    /// when the cross-sensing matrix is non-identity; the no-cross paths use
+    /// [`Sim::sense`] / [`Sim::sense_full`] for byte-identity.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn sense_cross(
+        &self,
+        s: usize,
+        x: f32,
+        y: f32,
+        angle: f32,
+        distance: f32,
+        attract: f32,
+        has_walls: bool,
+    ) -> f32 {
+        let sx = x + angle.cos() * distance;
+        let sy = y + angle.sin() * distance;
+        let idx = self.idx(sx, sy);
+        if has_walls && self.obstacles[idx] != 0 {
+            return 0.0;
+        }
+        let mut trail = 0.0f32;
+        for o in 0..SPECIES {
+            let w = self.cross_sense[s][o];
+            if w != 0.0 {
+                trail += w * self.field[o][idx];
+            }
+        }
         if attract != 0.0 {
             trail + attract * self.food[idx]
         } else {
@@ -2506,6 +2634,142 @@ mod tests {
             connected_at.is_some(),
             "maze demo never connected both endpoints within {BUDGET} ticks \
              (the network must route through the serpentine gaps)"
+        );
+    }
+
+    // --- Cross-species sensing tests ---
+
+    /// The cross-sensing matrix defaults to the identity, round-trips through the
+    /// accessors, and `reset` restores it. A default-matrix run is byte-identical to
+    /// the baseline golden (the own-trail fast path is taken).
+    #[test]
+    fn cross_sense_defaults_to_identity_and_is_inert() {
+        const GOLDEN_SEED: u64 = 0xABCD_1234;
+        const TICKS: usize = 60;
+        const GOLDEN_CHECKSUM: u64 = 0x8de7_8e52_803c_7618;
+
+        let mut sim = Sim::new(128, 128, GOLDEN_SEED);
+        // Default is identity: diagonal 1, off-diagonal 0.
+        for s in 0..SPECIES {
+            for o in 0..SPECIES {
+                let expected = if s == o { 1.0 } else { 0.0 };
+                assert_eq!(sim.cross_sense(s, o), expected);
+            }
+        }
+        // Out-of-range reads as 0 and writes are ignored.
+        assert_eq!(sim.cross_sense(SPECIES, 0), 0.0);
+        sim.set_cross_sense(SPECIES, 0, 5.0); // no-op
+                                              // Round-trip a write, then restore identity by hand and confirm inertness.
+        sim.set_cross_sense(0, 1, -0.6);
+        assert_eq!(sim.cross_sense(0, 1), -0.6);
+        sim.set_cross_sense(0, 1, 0.0);
+
+        for _ in 0..TICKS {
+            sim.tick();
+        }
+        assert_eq!(
+            checksum_all(&sim),
+            GOLDEN_CHECKSUM,
+            "identity cross-sense run drifted from the baseline golden"
+        );
+
+        // reset restores identity.
+        sim.set_cross_sense(0, 1, 0.9);
+        sim.reset(GOLDEN_SEED);
+        for s in 0..SPECIES {
+            for o in 0..SPECIES {
+                let expected = if s == o { 1.0 } else { 0.0 };
+                assert_eq!(
+                    sim.cross_sense(s, o),
+                    expected,
+                    "reset must restore identity"
+                );
+            }
+        }
+    }
+
+    /// Cross-sensing is deterministic and couples the species: under mutual avoidance
+    /// a fixed seed reproduces identical fields across two runs and matches a pinned
+    /// golden. Distinct from the identity golden (proves the matrix actually changes
+    /// the dynamics). If the rule changes on purpose, run once and paste the new value.
+    #[test]
+    fn cross_sense_is_deterministic() {
+        const SEED: u64 = 0xABCD_1234;
+        const TICKS: usize = 60;
+
+        let run = || {
+            let mut sim = Sim::new(128, 128, SEED);
+            sim.set_cross_sense(0, 1, -0.6);
+            sim.set_cross_sense(1, 0, -0.6);
+            for _ in 0..TICKS {
+                sim.tick();
+            }
+            checksum_all(&sim)
+        };
+        let a = run();
+        let b = run();
+        assert_eq!(a, b, "two cross-sense runs of the same seed must match");
+
+        const CROSS_GOLDEN_CHECKSUM: u64 = 0x3d9b_7b01_f419_0a81;
+        assert_eq!(
+            a, CROSS_GOLDEN_CHECKSUM,
+            "cross-sense checksum drifted from golden"
+        );
+
+        // The avoidance matrix must actually change the outcome vs. identity.
+        const IDENTITY_GOLDEN: u64 = 0x8de7_8e52_803c_7618;
+        assert_ne!(
+            a, IDENTITY_GOLDEN,
+            "avoidance must differ from the identity run"
+        );
+    }
+
+    /// Cross-sensing couples the species: under mutual avoidance their trail fields
+    /// segregate — the spatial overlap (cells where BOTH species hold significant
+    /// trail) is strictly lower than under the default identity matrix, from the same
+    /// seed after the same ticks. Overlap uses a per-field-relative threshold so it
+    /// compares structure, not absolute magnitude.
+    #[test]
+    fn mutual_avoidance_segregates_species() {
+        const SEED: u64 = 7;
+        const TICKS: usize = 400;
+        // A cell "holds" a species if its trail is at least this fraction of that
+        // species' own field max — adapts to each run's exposure.
+        const FRAC: f32 = 0.15;
+
+        let overlap = |sim: &Sim| -> usize {
+            let t0 = FRAC * sim.field_max(0);
+            let t1 = FRAC * sim.field_max(1);
+            let f0 = sim.field(0);
+            let f1 = sim.field(1);
+            let mut c = 0usize;
+            for k in 0..f0.len() {
+                if f0[k] > t0 && f1[k] > t1 {
+                    c += 1;
+                }
+            }
+            c
+        };
+
+        // Baseline: identity matrix (default).
+        let mut base = Sim::new(256, 256, SEED);
+        for _ in 0..TICKS {
+            base.tick();
+        }
+        let overlap_base = overlap(&base);
+
+        // Avoidance: each species repelled by the other's trail.
+        let mut avoid = Sim::new(256, 256, SEED);
+        avoid.set_cross_sense(0, 1, -0.6);
+        avoid.set_cross_sense(1, 0, -0.6);
+        for _ in 0..TICKS {
+            avoid.tick();
+        }
+        let overlap_avoid = overlap(&avoid);
+
+        assert!(
+            overlap_avoid < overlap_base,
+            "mutual avoidance should reduce species overlap: avoid {overlap_avoid} >= base {overlap_base}"
         );
     }
 }

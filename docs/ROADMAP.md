@@ -3,12 +3,13 @@
 Each milestone must produce something **visually rewarding** — that's the design constraint
 that keeps a side project alive. A milestone is done only when its **gate** is met.
 
-**Status: M0–M5 (the toy), M6 (world geography), and M7 (the preset gallery) are shipped.** The
-toy has the Physarum core, live controls, the boom/bust ecology, two coexisting species, and the
-inspect/measure/share instrument; M6 added obstacles, endpoint food sources, chemotaxis, and the
-reachability metric — the Physarum-solves-the-maze demo; M7 added a one-click gallery of
-classical scenarios that round-trip as shareable links. It all publishes to GitHub Pages (live
-demo + guide + API docs). **M8–M11 are the remaining lab phase**, sequenced in payoff order.
+**Status: M0–M8 are shipped.** The toy has the Physarum core, live controls, the boom/bust
+ecology, two coexisting species, and the inspect/measure/share instrument; M6 added obstacles,
+endpoint food sources, chemotaxis, and the reachability metric — the Physarum-solves-the-maze
+demo; M7 added a one-click gallery of classical scenarios that round-trip as shareable links; M8
+added cross-species sensing (a signed 2×2 matrix) for territories and predator/prey. It all
+publishes to GitHub Pages (live demo + guide + API docs). **M9–M11 are the remaining lab
+phase**, sequenced in payoff order.
 
 **From toy to lab.** The toy proves emergence is fun and reproducible; the lab proves the toy
 *computes* — it reproduces classical complex-systems demos as one-click presets — and lets you
@@ -81,7 +82,7 @@ codec, extended to carry geometry.
 **Gate:** pick a preset and the canonical structure appears in seconds; every preset round-trips
 as a shareable link.
 
-## M8 — Cross-species sensing: ecological coupling
+## M8 — Cross-species sensing: ecological coupling ✅ done
 Each species senses the other's trail with a signed attract/avoid weight (a 2×2 sensing
 matrix) — territories, predator/prey, chasing fronts, from a handful of lines in the agent loop.
 **Gate:** two species form a territory boundary or a chase that neither produces alone, and it

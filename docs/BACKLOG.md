@@ -101,12 +101,12 @@ The next-task queue. Open this first each session, do the top unchecked item, ti
 - [x] app: URL codec (`urlstate.ts`) carries the full scenario — params + ecology + `food_attraction` + `network_threshold` + the endpoint list + a built-in geometry tag (`maze`); hand-painted masks intentionally not serialized
 - [x] **Gate check:** verified in-browser — all 8 presets apply with distinct canonical structures, zero console errors; Tokyo / maze / competitive-exclusion links round-trip exactly
 
-## M8 — Cross-species sensing (gate: territories / a chase neither species makes alone; deterministic)
-- [ ] petri-core: a 2×2 signed sensing-weight matrix — each species senses the other's field with an attract/avoid weight; default 0 keeps current behavior byte-identical
-- [ ] petri-core: determinism re-baselined; predator/prey + territory tests
-- [ ] petri-wasm: cross-sensing setters/getters
-- [ ] app: cross-sensing controls + predator/prey & territory presets
-- [ ] **Gate check:** two species form a stable boundary or chase; same seed reproduces it
+## M8 — Cross-species sensing ✅ gate met — mutual avoidance segregates the species (5× less overlap); presets + links round-trip; deterministic
+- [x] petri-core: a 2×2 signed sensing-weight matrix (`cross_sense[s][o]`) — sense becomes `Σ_o cross_sense[s][o]·field[o]`, composed with chemotaxis + wall masking; default **identity** keeps the run byte-identical (gated `cross_sense_active()`; empty golden `0x8de7…` unchanged)
+- [x] petri-core: new cross-sense determinism golden + a segregation test (overlap 85 identity → 17 under mutual avoidance, same seed); 27/27 tests
+- [x] petri-wasm: `set_cross_sense(species, other, weight)` / `cross_sense(species, other)`
+- [x] app: **Cross-species sensing** Tweakpane folder (two off-diagonal sliders, guarded writes) + **Territories** (mutual avoidance) and **Predator/prey** (asymmetric pursuit) presets; scenario URL codec carries `crossSense`
+- [x] **Gate check:** verified in-browser — Territories keeps the two colors to separate domains, Predator/prey shows magenta tracking cyan; segregation measured 5× in the sim; coupling links round-trip; zero console errors
 
 ## M9 — Structure metrics (gate: a decay sweep shows component count collapse — a measured phase transition)
 - [ ] petri-core: connected components & loops (union-find / Euler characteristic), trail length & branching (skeleton), fractal dimension (box-counting), autocorrelation length — read-only, pre-allocated scratch

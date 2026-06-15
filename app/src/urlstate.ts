@@ -41,12 +41,22 @@ export interface Endpoint {
 // "maze" = regenerate the wall maze with `load_maze_demo` on load.
 export type GeometryTag = "none" | "maze";
 
+// Cross-species sensing off-diagonals: how strongly each species is pulled by
+// the OTHER's trail. `s01` = species 0 (cyan) senses species 1 (magenta);
+// `s10` = species 1 senses species 0. Positive = attracted, negative = repelled.
+// The diagonals (own-trail weights) stay at the default 1.0 and aren't carried.
+export interface CrossSense {
+  s01: number;
+  s10: number;
+}
+
 export interface SharedState {
   seed: number;
   species: SpeciesState[];
   network_threshold: number;
   geometry: GeometryTag;
   endpoints: Endpoint[];
+  crossSense: CrossSense;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +100,7 @@ export function readSharedState(sim: Sim, seed: number, geometry: GeometryTag): 
     network_threshold: sim.network_threshold(),
     geometry,
     endpoints,
+    crossSense: { s01: sim.cross_sense(0, 1), s10: sim.cross_sense(1, 0) },
   };
 }
 
@@ -142,6 +153,8 @@ function validateState(raw: unknown): SharedState | null {
       if (!isEndpoint(ep)) return null;
     }
   }
+  // crossSense is tolerant: older links that predate it decode to identity (0/0).
+  if (obj.crossSense !== undefined && !isCrossSense(obj.crossSense)) return null;
 
   // Normalize so callers can rely on the optional fields being present.
   // food_attraction defaults to 0 on any species that predates it.
@@ -149,6 +162,7 @@ function validateState(raw: unknown): SharedState | null {
     ...sp,
     food_attraction: typeof sp.food_attraction === "number" ? sp.food_attraction : 0,
   }));
+  const cs = obj.crossSense as Partial<CrossSense> | undefined;
   const normalized: SharedState = {
     seed: obj.seed as number,
     species,
@@ -156,6 +170,10 @@ function validateState(raw: unknown): SharedState | null {
       typeof obj.network_threshold === "number" ? (obj.network_threshold as number) : 0.05,
     geometry: obj.geometry === "maze" ? "maze" : "none",
     endpoints: Array.isArray(obj.endpoints) ? (obj.endpoints as Endpoint[]) : [],
+    crossSense: {
+      s01: typeof cs?.s01 === "number" ? cs.s01 : 0,
+      s10: typeof cs?.s10 === "number" ? cs.s10 : 0,
+    },
   };
   return normalized;
 }
@@ -187,4 +205,13 @@ function isEndpoint(v: unknown): v is Endpoint {
   if (typeof v !== "object" || v === null) return false;
   const obj = v as Record<string, unknown>;
   return typeof obj.x === "number" && typeof obj.y === "number" && typeof obj.radius === "number";
+}
+
+function isCrossSense(v: unknown): v is CrossSense {
+  if (typeof v !== "object" || v === null) return false;
+  const obj = v as Record<string, unknown>;
+  // Both fields are tolerant (older links omit either); only reject wrong types.
+  if (obj.s01 !== undefined && typeof obj.s01 !== "number") return false;
+  if (obj.s10 !== undefined && typeof obj.s10 !== "number") return false;
+  return true;
 }

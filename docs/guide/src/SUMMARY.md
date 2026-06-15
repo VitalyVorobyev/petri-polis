@@ -8,6 +8,7 @@
 - [Determinism](./determinism.md)
 - [Ecology and population dynamics](./ecology.md)
 - [Two species](./two-species.md)
+- [Cross-species sensing](./cross-species.md)
 - [Sources, sinks & mazes](./geography.md)
 - [The preset gallery](./presets.md)
 - [Parameter reference](./parameters.md)
