@@ -28,6 +28,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Doc (deny warnings)
+        run: cargo doc --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   web:
     name: Web — lint, wasm, build
