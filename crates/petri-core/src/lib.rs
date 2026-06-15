@@ -881,14 +881,22 @@ impl Sim {
                 let dx_raw = (col as f32 + 0.5 - x).abs();
                 let dx = dx_raw.min(wf - dx_raw);
                 if dx * dx + dy * dy <= r2 {
-                    let cell = &mut self.obstacles[base + col];
-                    if *cell != val {
+                    let idx = base + col;
+                    if self.obstacles[idx] != val {
                         if on {
                             self.obstacle_count += 1;
+                            // Turning an open cell into a wall: zero the stale trail
+                            // under it now, before the next field pass. Otherwise
+                            // `blur_field_decay` would read the old value and diffuse
+                            // hidden trail out of the wall into its neighbours for one
+                            // tick, seeding the far side of a freshly-painted barrier.
+                            for f in self.field.iter_mut() {
+                                f[idx] = 0.0;
+                            }
                         } else {
                             self.obstacle_count -= 1;
                         }
-                        *cell = val;
+                        self.obstacles[idx] = val;
                     }
                 }
             }
@@ -907,14 +915,20 @@ impl Sim {
         for row in ya..=yb {
             let base = row * w;
             for col in xa..=xb {
-                let cell = &mut self.obstacles[base + col];
-                if *cell != val {
+                let idx = base + col;
+                if self.obstacles[idx] != val {
                     if on {
                         self.obstacle_count += 1;
+                        // Zero stale trail under a newly-walled cell (see
+                        // `paint_obstacle`): keeps the next blur from diffusing hidden
+                        // trail out of the wall for one tick.
+                        for f in self.field.iter_mut() {
+                            f[idx] = 0.0;
+                        }
                     } else {
                         self.obstacle_count -= 1;
                     }
-                    *cell = val;
+                    self.obstacles[idx] = val;
                 }
             }
         }
@@ -1034,6 +1048,15 @@ impl Sim {
         let t = (w / 64).max(1); // wall thickness in cells
         let gap = (h / 6).max(3); // corridor gap height
         let margin = h / 8; // keep gaps off the top/bottom edges
+
+        // Seal the toroidal x=0↔width seam with a full-height wall (thickness `t`).
+        // Movement and the reachability flood-fill both wrap, and without this seal a
+        // straight horizontal trail across the open seam would connect the two end
+        // wells without threading the serpentine gaps — defeating the demo. Both
+        // endpoints (≈0.08·w / 0.92·w) and the spawn corridor (≈0.02·w) sit well to
+        // the right of an `x∈[0, t)` wall, so this leaves them clear.
+        self.paint_obstacle_rect(0, 0, t.saturating_sub(1), h - 1, true);
+
         let wall_xs = [w / 4, w / 2, (3 * w) / 4];
         for (k, &wx) in wall_xs.iter().enumerate() {
             let x0 = wx.saturating_sub(t / 2);
@@ -1089,34 +1112,32 @@ impl Sim {
             self.params[s].food_attraction = 6.0;
         }
 
-        // --- Respawn the population in the open left corridor, near endpoint 0, so
-        // the network must thread the maze to reach endpoint 1. Agents are seeded
-        // inside the corridor and only in open (non-wall) cells: a rejection sample
-        // drawing from the sim PRNG in a fixed order (the determinism contract). The
-        // species alternate round-robin (no RNG draw), matching `spawn_initial`. ---
+        // --- Pre-grow the mold: blanket the whole maze. The canonical "Physarum
+        // solves the maze" setup starts with the colony filling every open cell, so a
+        // connected network already threads all the serpentine gaps; the interesting
+        // dynamics are the *pruning* that follows as chemotaxis pulls trail toward the
+        // two wells and the food-starved detours fade. Seeding only the left corridor
+        // never connects — agents that wander into the food-less middle starve before
+        // laying a trail through to the far well. Agents are seeded uniformly across
+        // all open (non-wall) cells of the maze by rejection-sampling from the sim
+        // PRNG in a fixed order (the determinism contract). The species alternate
+        // round-robin (no RNG draw), matching `spawn_initial`. ---
         self.x.clear();
         self.y.clear();
         self.heading.clear();
         self.energy.clear();
         self.species.clear();
         let count = (w * h / 8).min(self.capacity());
-        // Corridor box: the left bay, from the left edge to just before the first
-        // wall, clear of the top/bottom edges.
-        let bx0 = wf * 0.02;
-        let bx1 = (wall_xs[0] as f32) - (t as f32) - 2.0;
-        let by0 = 2.0;
-        let by1 = hf - 2.0;
-        let bw = (bx1 - bx0).max(1.0);
-        let bh = (by1 - by0).max(1.0);
         for i in 0..count {
             let s = i % SPECIES;
-            // Rejection-sample an open cell in the corridor box. A bounded retry keeps
-            // the RNG draw count finite and deterministic; the fallback is endpoint 0.
+            // Rejection-sample an open cell anywhere in the maze. A bounded retry keeps
+            // the RNG draw count finite and deterministic; the fallback is endpoint 0
+            // (always open). Each attempt draws (x, y) so the draw count is fixed.
             let mut px = self.endpoint_x(0);
             let mut py = self.endpoint_y(0);
             for _ in 0..16 {
-                let tx = bx0 + self.rng.next_f32() * bw;
-                let ty = by0 + self.rng.next_f32() * bh;
+                let tx = self.rng.next_f32() * wf;
+                let ty = self.rng.next_f32() * hf;
                 if self.obstacles[self.idx(tx, ty)] == 0 {
                     px = tx;
                     py = ty;
@@ -1493,10 +1514,11 @@ impl Sim {
     }
 
     /// Geography-aware sensor: like [`Sim::sense`], but a sample over a wall cell
-    /// reads `0` trail (when `has_walls`), and the food field at the sensor adds
-    /// `attract * food` to the reading (when `attract != 0`) so the agent steers up
-    /// the food gradient. Only called on the obstacle/attraction path; the default
-    /// path uses [`Sim::sense`] for byte-identity.
+    /// reads `0` (fully masked-out geography — neither trail nor food, when
+    /// `has_walls`), and the food field at the sensor adds `attract * food` to the
+    /// reading (when `attract != 0`) so the agent steers up the food gradient. Only
+    /// called on the obstacle/attraction path; the default path uses [`Sim::sense`]
+    /// for byte-identity.
     // A flat argument list mirrors the hot-loop call site (no struct churn per agent).
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
@@ -1513,11 +1535,13 @@ impl Sim {
         let sx = x + angle.cos() * distance;
         let sy = y + angle.sin() * distance;
         let idx = self.idx(sx, sy);
-        let trail = if has_walls && self.obstacles[idx] != 0 {
-            0.0
-        } else {
-            self.field[s][idx]
-        };
+        // A wall cell is blocked geography: it emits no signal at all, so neither the
+        // trail nor the food there should pull an agent toward it (a random food patch
+        // or an endpoint skirt can overlap a wall). Mask the whole sample to 0.
+        if has_walls && self.obstacles[idx] != 0 {
+            return 0.0;
+        }
+        let trail = self.field[s][idx];
         if attract != 0.0 {
             trail + attract * self.food[idx]
         } else {
@@ -2125,7 +2149,7 @@ mod tests {
         let b = run();
         assert_eq!(a, b, "two maze runs of the same seed must match");
 
-        const MAZE_GOLDEN_CHECKSUM: u64 = 0x5b28_bd63_4588_0691;
+        const MAZE_GOLDEN_CHECKSUM: u64 = 0xb5c4_42c3_0c1f_271b;
         assert_eq!(
             a, MAZE_GOLDEN_CHECKSUM,
             "maze-demo combined field checksum drifted from golden"
@@ -2177,6 +2201,27 @@ mod tests {
         );
         assert!(sim.obstacles().iter().all(|&v| v == 0 || v == 1));
 
+        // The toroidal x=0 seam is sealed full-height (otherwise a straight trail
+        // across the open seam would bypass the serpentine).
+        let h = sim.height();
+        let w = sim.width();
+        for row in 0..h {
+            assert_eq!(
+                sim.obstacles()[row * w],
+                1,
+                "x=0 seam must be walled at every row (row {row})"
+            );
+        }
+        // ...and the endpoints + spawn corridor stay clear of that seam wall.
+        for i in 0..sim.endpoint_count() {
+            let idx = sim.idx(sim.endpoint_x(i), sim.endpoint_y(i));
+            assert_eq!(
+                sim.obstacles()[idx],
+                0,
+                "endpoint {i} must sit in an open cell, not the seam wall"
+            );
+        }
+
         // A maze run stays bounded and never reallocates the trail buffers.
         for _ in 0..200 {
             sim.tick();
@@ -2192,6 +2237,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The seam seal works: with the maze walls in place, a single straight
+    /// horizontal band of trail at the endpoints' shared y does NOT connect the two
+    /// wells — the band is blocked by the interior walls (whose gaps are at other
+    /// rows) and can no longer slip around the toroidal x=0 seam. The only way to
+    /// register `endpoints_connected == 2` is to thread the serpentine gaps.
+    #[test]
+    fn maze_seam_blocks_a_straight_bridge() {
+        let mut sim = Sim::new(128, 128, 3);
+        sim.load_maze_demo();
+
+        // Lay a strong, full-width horizontal band of trail at the endpoints' row.
+        // (Both endpoints share the same y in the demo, so a single band covers both.)
+        let w = sim.width();
+        let h = sim.height();
+        let row = (sim.endpoint_y(0) as usize).min(h - 1);
+        for r in row.saturating_sub(1)..=(row + 1).min(h - 1) {
+            for col in 0..w {
+                sim.field[0][r * w + col] = 10.0;
+            }
+        }
+
+        // Endpoint 0 is in the network; endpoint 1 is walled off from a straight
+        // band, so it must NOT count as connected through the seam.
+        assert_eq!(
+            sim.endpoints_connected(),
+            1,
+            "a straight horizontal band must not bypass the serpentine via the seam"
+        );
     }
 
     /// A reachability scenario hand-built on the trail field: two endpoints in an
@@ -2393,5 +2468,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The M6 gate, proven forward: run the maze demo and confirm the network
+    /// actually routes around the walls and connects the two endpoint wells —
+    /// `endpoints_connected()` reaches `2` at some tick. This is the throttle-free,
+    /// in-sim proof that the demo solves the maze without the seam cheat: the
+    /// pre-grown colony blankets every open cell, so a connected network threads all
+    /// the serpentine gaps from the first ticks; `maze_seam_blocks_a_straight_bridge`
+    /// separately proves that connection cannot be a straight bridge across the seam.
+    #[test]
+    fn maze_demo_connects_the_endpoints() {
+        const SEED: u64 = 0x00C0_FFEE;
+        // A generous budget: the blanketed network connects within a few ticks, but
+        // ticking out to a few thousand keeps the proof robust and still runs in well
+        // under a second natively.
+        const BUDGET: usize = 4000;
+
+        let mut sim = Sim::new(128, 128, SEED);
+        sim.load_maze_demo();
+        // Both wells start disconnected — no trail has been laid yet.
+        assert_eq!(
+            sim.endpoints_connected(),
+            0,
+            "no network exists before the first tick"
+        );
+
+        let mut connected_at: Option<usize> = None;
+        for t in 1..=BUDGET {
+            sim.tick();
+            if sim.endpoints_connected() == 2 {
+                connected_at = Some(t);
+                break;
+            }
+        }
+        assert!(
+            connected_at.is_some(),
+            "maze demo never connected both endpoints within {BUDGET} ticks \
+             (the network must route through the serpentine gaps)"
+        );
     }
 }

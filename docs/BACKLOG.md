@@ -83,14 +83,16 @@ The next-task queue. Open this first each session, do the top unchecked item, ti
 - [x] petri-core: `food_attraction` `Params` knob (default `0.0`) — sense step adds `food_attraction * food_sample` per sensor, guarded so the zero default is byte-identical
 - [x] petri-core: endpoint food sources (`add_endpoint`/`clear_endpoints`) pinning `food_cap` high within a radius, reusing the Gaussian food-cap machinery
 - [x] petri-core: reachability / network-cost metric — threshold the combined trail field, flood-fill from endpoint 0 over open cells (pre-allocated scratch, on-demand, read-only); report `endpoints_connected` + `network_cost`
-- [x] petri-core: `load_maze_demo` — clears default food, lays a three-wall serpentine maze, places two endpoints, sets `food_attraction`, respawns in-corridor (a reproducible built-in scenario)
-- [x] petri-core: tests — existing golden checksum UNCHANGED (empty geometry byte-identical); new maze-scenario golden; reachability disconnected→connected + obstacle-split-stays-disconnected; `maze_agents_never_enter_walls`; `food_attraction_zero_is_inert` (22/22 pass)
+- [x] petri-core: `load_maze_demo` — clears default food, lays a three-wall serpentine maze + a sealed toroidal-seam wall (so the only route threads the gaps), places two endpoints, sets `food_attraction`, and blanket-seeds the colony across all open cells (pre-grown-mold coverage)
+- [x] petri-core: walls fully masked from chemotaxis (wall cells read 0 trail AND 0 food in the sensor); painting a wall zeroes the trail under it immediately (no one-tick diffusion leak)
+- [x] petri-core: tests — empty-geometry golden checksum UNCHANGED (byte-identical); re-pinned maze golden; reachability disconnected→connected + obstacle-split-stays-disconnected; `maze_seam_blocks_a_straight_bridge`; `maze_demo_connects_the_endpoints`; `maze_agents_never_enter_walls`; `food_attraction_zero_is_inert` (24/24 pass)
 - [x] petri-wasm: `obstacle_ptr`/`obstacle_len` (stable), `paint_obstacle`/`clear_obstacles`, `add_endpoint`/`clear_endpoints` + endpoint accessors, `load_maze_demo`, `set_food_attraction`/getter, `set_network_threshold`/getter, `endpoints_connected`/`network_cost`
 - [x] app: upload the obstacle mask as an `R8` texture; render walls as a dim slate underlay in the tone-map pass, suppressing trail/food/bloom there
 - [x] app: endpoint markers (additive amber rings) at endpoint positions
 - [x] app: pointer tool selector — spawn / paint wall / erase wall / place endpoint (click-drag painting) — + "load maze demo" and "clear geometry" buttons; obstacle view folded into the re-fetch path
 - [x] app: reachability readout in the metrics panel (connected k/n + network cost, with a network-cost sparkline)
-- [x] **Gate check:** verified in-browser — `load_maze_demo` + 10× speed; the network routes through the serpentine walls and bridges both wells, `connected` reaches `2/2` within seconds (flickering to `1/2` during busts), zero console errors
+- [x] **Gate check:** verified (native `maze_demo_connects_the_endpoints` reaches `2/2`; in-browser `load_maze_demo` + 10× spans both wells, zero console errors). The colony connects via pre-grown coverage, then the food-starved interior thins and it settles at `1/2` — a *persistent* shortest-path tube needs a longer-range attractant (follow-up below)
+- [ ] follow-up (M6.1): long-range chemoattractant (diffusing food gradient) so traffic is sustained across the maze and the connecting tube persists / prunes to the shortest route — the full "Physarum solves the maze" result
 
 ## M7 — Presets: the lab bench (gate: pick a preset → canonical structure in seconds; presets share as links)
 - [ ] petri-core/petri-wasm: scenario serialization — params + ecology + geometry (walls/endpoints/food) + spawn, round-trippable through the boundary

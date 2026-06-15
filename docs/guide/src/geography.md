@@ -82,19 +82,25 @@ the simulation):
    - `network_cost()` — how many cells the flood visited: the size of the connecting structure, a
      proxy for total path length. A leaner network solving the same task scores lower.
 
-Watch `endpoints_connected` flip from `1` to `2` as the trail first bridges two wells, then watch
-`network_cost` fall as the colony prunes its early exploratory mesh down toward the shortest route —
-the quantitative signature of the maze being solved.
+When the demo loads, the blanketed colony spans the whole maze at once, so `endpoints_connected`
+reads `2` from the first ticks. Then, with food only at the two wells and chemotaxis acting only
+within sensor range, the starved interior of the maze thins and the connecting trail contracts back
+toward the wells — `network_cost` falls and the metric reads out how much of the bridge through the
+gaps survives. (Sustaining a *persistent* tube along the shortest route — the part of the
+laboratory result where the mold prunes to a single path — needs a longer-range attractant than
+local sensing provides; that is a natural next step for the lab.)
 
 ## The maze demo
 
 `load_maze_demo()` assembles all of the above into one reproducible scenario: it clears the random
-food patches, lays a set of offset-gap walls into the mask to make a serpentine corridor, places a
-food well at each end, sets a positive `food_attraction` so the colony is drawn between them, and
-respawns the agents in the open cells of the entry corridor. Because it rebuilds the world it is a
+food patches, lays a set of offset-gap walls into the mask to make a serpentine corridor, seals the
+world edge with a wall (so the toroidal seam can't slip the colony around the maze instead of
+through it), places a food well at each end, sets a positive `food_attraction` so the colony is
+drawn toward them, and respawns the colony across **every open cell** — blanketing the maze, the
+pre-grown-mold state the laboratory experiment starts from. Because it rebuilds the world it is a
 reset-class call — re-fetch the field, food, and obstacle views afterwards, just as you would after
-`reset`. From the same seed it runs identically every time, which is what makes "watch it solve the
-maze" a repeatable demonstration rather than a lucky frame.
+`reset`. From the same seed it runs identically every time, which is what makes it a repeatable
+demonstration rather than a lucky frame.
 
 ## Determinism preserved
 
