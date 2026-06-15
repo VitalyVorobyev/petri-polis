@@ -434,6 +434,62 @@ impl Sim {
         self.inner.network_cost()
     }
 
+    // --- Structure metrics: cheap, read-only observables over the thresholded
+    // combined-trail foreground (same masking as `network_cost`: open cells whose
+    // combined trail clears `network_threshold * combined_max`, 4-connected,
+    // toroidal). All are computed on demand — they never tick the sim, mutate its
+    // state, or draw RNG. The ones writing scratch take `&mut self`. ---
+
+    /// Number of connected components in the thresholded combined-trail foreground —
+    /// high for a scattered speckle of blobs, dropping toward `1` as the network
+    /// links up. `0` when there is no foreground. Fills the component-label buffer as
+    /// a side effect (see [`Sim::component_labels_ptr`]). On-demand read-only.
+    pub fn component_count(&mut self) -> u32 {
+        self.inner.component_count()
+    }
+
+    /// Number of independent loops (cycles) in the foreground — the first Betti
+    /// number `b1 = edges - cells + components` of the 4-connected grid graph. `0`
+    /// for a tree/forest, positive once the network closes a loop. Also fills the
+    /// component-label buffer. On-demand read-only.
+    pub fn loop_count(&mut self) -> u32 {
+        self.inner.loop_count()
+    }
+
+    /// Box-counting (Minkowski–Bouligand) fractal dimension of the foreground —
+    /// least-squares slope of `log(occupied boxes)` vs `log(1/box size)` over
+    /// power-of-two box sizes. Near `1` for a sparse, filament-like network; toward
+    /// `2` for a space-filling one. `0.0` for an empty foreground. On-demand
+    /// read-only.
+    pub fn fractal_dimension(&mut self) -> f32 {
+        self.inner.fractal_dimension()
+    }
+
+    /// Spatial autocorrelation length of the combined trail field, in cells — the
+    /// grain size, read off as the lag at which the radially-averaged autocorrelation
+    /// first falls to `1/e`. Larger for a coarse field (broad blobs), smaller for a
+    /// fine one. `0.0` for a flat field. On-demand read-only.
+    pub fn autocorrelation_length(&self) -> f32 {
+        self.inner.autocorrelation_length()
+    }
+
+    /// Pointer to the per-cell component-label buffer within WASM linear memory
+    /// (`u32` per cell: `0` = background, else a `1..=component_count` component id).
+    /// Pair with [`Sim::component_labels_len`] to build
+    /// `new Uint32Array(memory.buffer, ptr, len)` for a component-map overlay. The
+    /// buffer is filled by the most recent `component_count` / `loop_count` call
+    /// (all-zero before any call). Stable for the run (it never reallocates) —
+    /// re-fetch only after a reset-class call, like the field/obstacle views.
+    pub fn component_labels_ptr(&self) -> *const u32 {
+        self.inner.component_labels().as_ptr()
+    }
+
+    /// Length of the component-label buffer in cells (`width * height`, same as a
+    /// field).
+    pub fn component_labels_len(&self) -> usize {
+        self.inner.component_labels().len()
+    }
+
     /// Load the built-in "Physarum solves the maze" scenario: a wall maze, two
     /// endpoint food wells, food-attraction on, and a population seeded in the open
     /// left corridor. **Reset-class** — it rewrites obstacles, endpoints, food, and

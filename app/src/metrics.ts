@@ -12,6 +12,12 @@ export interface MetricSample {
   connected: number; // endpoints reachable from endpoint 0 (incl. itself)
   endpointCount: number; // total endpoints
   networkCost: number; // cells in the reachable network (unbounded)
+  // Structure metrics — heavier O(N) reductions, sampled on a throttled cadence
+  // (the last value is reused between samples, so successive samples may repeat).
+  componentCount: number; // connected components in the thresholded foreground (gate)
+  loopCount: number; // independent loops (first Betti number b1) of the foreground
+  fractalDimension: number; // box-counting dimension of the foreground, ~1..2
+  autocorrLength: number; // trail-field autocorrelation (grain) length, in cells
 }
 
 const RING_CAP = 600;
@@ -27,6 +33,10 @@ export class MetricsBuffer {
   // Running maximum for the unbounded network-cost series.
   maxNetworkCost = 1;
 
+  // Running maximum for the component-count series (unbounded above; collapses
+  // toward 1 at the decay phase transition — that collapse is the gate signal).
+  maxComponentCount = 1;
+
   // Food ceiling: total food right after new/reset (food starts full).
   foodCeiling = 1;
 
@@ -41,6 +51,7 @@ export class MetricsBuffer {
     if (s.mass[0] > this.maxMass[0]) this.maxMass[0] = s.mass[0];
     if (s.mass[1] > this.maxMass[1]) this.maxMass[1] = s.mass[1];
     if (s.networkCost > this.maxNetworkCost) this.maxNetworkCost = s.networkCost;
+    if (s.componentCount > this.maxComponentCount) this.maxComponentCount = s.componentCount;
   }
 
   // Chronological ordered snapshot (oldest → newest).
@@ -55,6 +66,7 @@ export class MetricsBuffer {
     this.count = 0;
     this.maxMass = [1, 1];
     this.maxNetworkCost = 1;
+    this.maxComponentCount = 1;
     // foodCeiling is reset by the caller after querying the new value.
   }
 
@@ -80,7 +92,8 @@ export function drawSparklines(
 
   const samples = buf.ordered();
 
-  // Layout: 4 rows, each CELL_H px tall with a GAP between.
+  // Layout: 6 sparkline rows (each CELL_H px tall with a GAP between) followed
+  // by a compact two-line structure-metrics readout.
   const PAD_L = 6;
   const PAD_R = 6;
   const PAD_T = 6;
@@ -214,6 +227,40 @@ export function drawSparklines(
       1.2,
     );
   }
+
+  // --- Row 5: Component count (the gate metric) ---
+  // High for a scattered speckle of blobs, collapsing toward 1 as the network
+  // links up — the collapse at the decay phase transition is the gate signal.
+  {
+    const top = rowY(5);
+    const maxC = Math.max(1, buf.maxComponentCount);
+    drawLabel(ctx, PAD_L, top, `components  ${latest.componentCount}`);
+    drawLine(
+      ctx,
+      samples,
+      PAD_L,
+      top + LABEL_H,
+      plotW,
+      CELL_H - LABEL_H,
+      (s) => s.componentCount / maxC,
+      "#9f7aea",
+      1.2,
+    );
+  }
+
+  // --- Structure readout: loops, fractal dimension, autocorrelation length ---
+  // The remaining structure metrics as a compact two-line text readout below
+  // the last sparkline (no extra rows — these read as single numbers).
+  {
+    const top = rowY(6);
+    drawLabel(
+      ctx,
+      PAD_L,
+      top,
+      `loops ${latest.loopCount}   D ${latest.fractalDimension.toFixed(2)}`,
+    );
+    drawLabel(ctx, PAD_L, top + LABEL_H, `autocorr ${latest.autocorrLength.toFixed(1)} cells`);
+  }
 }
 
 // Draw a thin sparkline within a (x, y, w, h) box.
@@ -282,7 +329,9 @@ function fmtSI(n: number): string {
 // Export helpers
 // ---------------------------------------------------------------------------
 
-const CSV_HEADER = "tick,pop0,pop1,mass0,mass1,food_total,food_coverage";
+const CSV_HEADER =
+  "tick,pop0,pop1,mass0,mass1,food_total,food_coverage," +
+  "component_count,loop_count,fractal_dimension,autocorrelation_length";
 
 function sampleToCSV(s: MetricSample): string {
   return [
@@ -293,6 +342,10 @@ function sampleToCSV(s: MetricSample): string {
     s.mass[1].toFixed(2),
     s.foodTotal.toFixed(2),
     s.foodCoverage.toFixed(4),
+    s.componentCount,
+    s.loopCount,
+    s.fractalDimension.toFixed(4),
+    s.autocorrLength.toFixed(4),
   ].join(",");
 }
 

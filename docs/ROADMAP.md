@@ -3,13 +3,14 @@
 Each milestone must produce something **visually rewarding** — that's the design constraint
 that keeps a side project alive. A milestone is done only when its **gate** is met.
 
-**Status: M0–M8 are shipped.** The toy has the Physarum core, live controls, the boom/bust
+**Status: M0–M9 are shipped.** The toy has the Physarum core, live controls, the boom/bust
 ecology, two coexisting species, and the inspect/measure/share instrument; M6 added obstacles,
 endpoint food sources, chemotaxis, and the reachability metric — the Physarum-solves-the-maze
 demo; M7 added a one-click gallery of classical scenarios that round-trip as shareable links; M8
-added cross-species sensing (a signed 2×2 matrix) for territories and predator/prey. It all
-publishes to GitHub Pages (live demo + guide + API docs). **M9–M11 are the remaining lab
-phase**, sequenced in payoff order.
+added cross-species sensing (a signed 2×2 matrix) for territories and predator/prey; M9 added
+structure metrics (components, loops, fractal dimension, grain) and made them visible as
+measured phase transitions. It all publishes to GitHub Pages (live demo + guide + API docs).
+**M10–M11 are the remaining lab phase**, sequenced in payoff order.
 
 **From toy to lab.** The toy proves emergence is fun and reproducible; the lab proves the toy
 *computes* — it reproduces classical complex-systems demos as one-click presets — and lets you
@@ -88,11 +89,12 @@ matrix) — territories, predator/prey, chasing fronts, from a handful of lines 
 **Gate:** two species form a territory boundary or a chase that neither produces alone, and it
 stays deterministic.
 
-## M9 — Structure metrics: the render becomes a measurement
-Cheap, read-only observables that quantify emergence — connected components & loops (union-find
-/ Euler characteristic), trail length & branching (skeleton), fractal dimension (box-counting),
-spatial autocorrelation length, plus a Lyapunov-style seed-perturbation divergence — exposed as
-new metric series and render overlays (component map, skeleton, long-exposure).
+## M9 — Structure metrics: the render becomes a measurement ✅ done
+Read-only, on-demand observables that quantify *form*: connected components & independent loops
+(union-find + the grid graph's Betti number), box-counting fractal dimension, and the
+autocorrelation grain length — plotted in the sparklines and CSV, and made visible by two render
+modes (a component map and a long-exposure integrator). (Skeleton length/branching and a
+Lyapunov-style divergence are tracked as follow-ups.)
 **Gate:** a slow `decay` sweep shows the component count collapse at a threshold — a measured
 phase transition, on screen and in the exported CSV.
 

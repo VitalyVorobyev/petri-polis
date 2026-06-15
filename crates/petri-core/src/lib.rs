@@ -257,8 +257,21 @@ const FOOD_COVERAGE_EPSILON: f32 = 0.02;
 /// Default reachability threshold: a cell joins the network if its combined trail
 /// (`field[0] + field[1]`) is at least this fraction of the current combined
 /// field max. The network-cost / connectivity reduction flood-fills over cells at
-/// or above this. Live-tunable via [`Sim::set_network_threshold`].
+/// or above this. The structure metrics (components, loops, fractal dimension)
+/// share this threshold and the same foreground masking. Live-tunable via
+/// [`Sim::set_network_threshold`].
 const DEFAULT_NETWORK_THRESHOLD: f32 = 0.05;
+
+/// Largest box edge (in cells) the box-counting fractal dimension samples. The
+/// estimator counts occupied boxes at the power-of-two sizes from `1` up to this,
+/// then takes the least-squares slope of `log(box_count)` vs `log(1/size)`. Capped
+/// so even a small field has at least two usable sample sizes.
+const FRACTAL_MAX_BOX: usize = 64;
+
+/// Lags (in cells) at which the radially-averaged autocorrelation is sampled. The
+/// grain size is read off as the lag where the averaged correlation first falls to
+/// `1/e` of its zero-lag value, linearly interpolated between bracketing samples.
+const AUTOCORR_LAGS: [usize; 12] = [1, 2, 3, 4, 6, 8, 11, 16, 22, 32, 45, 64];
 
 /// A persistent endpoint food source: a circular region (toroidal) whose
 /// `food_cap` is pinned high, so it keeps regrowing and draws chemotactic agents.
@@ -400,6 +413,18 @@ pub struct Sim {
     /// Flood-fill BFS-queue scratch, `width * height` (a worst-case full frontier).
     /// Pre-allocated at `new`, reused by the reachability reduction.
     bfs_queue: Vec<u32>,
+
+    /// Per-cell component label, `width * height`. `0` = background (below
+    /// threshold, or a wall); any other value is a connected-component id (ids are
+    /// the small integers `1..=component_count`, assigned in first-seen raster
+    /// order). Filled on demand by [`Sim::label_components`] (the components / loops
+    /// reduction) and exposed zero-copy to the renderer for a component-map overlay,
+    /// like the obstacle mask. Pre-allocated at `new`; never reallocated.
+    component_labels: Vec<u32>,
+    /// Union-find parent scratch for the component labeller, `width * height`.
+    /// Pre-allocated at `new`, reused by the on-demand structure-metrics reduction;
+    /// never grows, never touched inside `tick`.
+    uf_parent: Vec<u32>,
 }
 
 impl Sim {
@@ -447,6 +472,8 @@ impl Sim {
             network_threshold: DEFAULT_NETWORK_THRESHOLD,
             visited: vec![0u32; cells],
             bfs_queue: vec![0u32; cells],
+            component_labels: vec![0u32; cells],
+            uf_parent: vec![0u32; cells],
         };
         // RNG draw order is load-bearing for determinism: patches first, then the
         // initial population. `reset` mirrors this exact order.
@@ -1368,6 +1395,367 @@ impl Sim {
     /// network above threshold. On-demand, read-only.
     pub fn network_cost(&mut self) -> u32 {
         self.reachability().1
+    }
+
+    // --- Structure metrics: cheap, read-only observables that quantify the
+    // emergent network. All four operate on the same **foreground** — open
+    // (non-wall) cells whose combined trail `field[0] + field[1]` is at least
+    // `network_threshold * combined_max` — with 4-connectivity and toroidal wrap,
+    // matching the sim and the reachability BFS. Each is computed on demand (never
+    // inside `tick`), over pre-allocated scratch, and never mutates sim state or
+    // draws RNG — so determinism is untouched. ---
+
+    /// The absolute foreground threshold for the current combined field: the larger
+    /// of `network_threshold * combined_max` and a strictly-positive floor, so a
+    /// literal-`0` threshold still excludes empty cells. Returns `None` when the
+    /// combined field is everywhere zero (no structure at all). Pure (no scratch).
+    #[inline]
+    fn foreground_threshold(&self) -> Option<f32> {
+        let n = self.width * self.height;
+        let mut max_combined = 0.0f32;
+        for k in 0..n {
+            let v = self.field[0][k] + self.field[1][k];
+            if v > max_combined {
+                max_combined = v;
+            }
+        }
+        if max_combined <= 0.0 {
+            return None;
+        }
+        Some((self.network_threshold * max_combined).max(f32::MIN_POSITIVE))
+    }
+
+    /// Whether cell `idx` is in the foreground for the given absolute `thresh`: open
+    /// (not a wall) and combined trail at or above `thresh`.
+    #[inline(always)]
+    fn is_foreground(&self, idx: usize, thresh: f32) -> bool {
+        self.obstacles[idx] == 0 && self.field[0][idx] + self.field[1][idx] >= thresh
+    }
+
+    /// Label the foreground into connected components by union-find over the
+    /// 4-connected, toroidal grid graph, then flatten the labels into
+    /// `component_labels` (`0` = background, else a `1..=count` component id in
+    /// first-seen raster order). Returns `(component_count, v, e)` where `v` is the
+    /// number of foreground cells and `e` the number of distinct 4-adjacent
+    /// foreground pairs (each unordered edge counted once). From these the caller
+    /// derives the loop count via the first Betti number `e - v + count`.
+    ///
+    /// One pass unions each foreground cell with its right and down neighbours
+    /// (toroidal); counting only these two directions per cell visits every
+    /// undirected edge exactly once, so `e` is exact. A second pass flattens roots
+    /// to dense ids and writes the labels. Read-only: no RNG, no state mutation
+    /// beyond the pre-allocated `uf_parent` / `component_labels` scratch. Never
+    /// called inside `tick`; allocation-free.
+    fn label_components(&mut self) -> (u32, u32, u32) {
+        let w = self.width;
+        let h = self.height;
+        let n = w * h;
+
+        // Clear the label buffer up front so an early return leaves it consistent
+        // (all-background), matching the empty-field contract.
+        for v in self.component_labels.iter_mut() {
+            *v = 0;
+        }
+
+        let thresh = match self.foreground_threshold() {
+            Some(t) => t,
+            None => return (0, 0, 0),
+        };
+
+        // Initialise union-find: every cell is its own root. (Background cells are
+        // never unioned and never counted, so their parent value is irrelevant.)
+        for (k, p) in self.uf_parent.iter_mut().enumerate() {
+            *p = k as u32;
+        }
+        // The second pass uses `visited` as a root→dense-id map (0 = unassigned).
+        // It is shared scratch the reachability fill may have left dirty, so zero it
+        // first; the reachability fill zeroes it for itself, so we needn't restore it.
+        for v in self.visited.iter_mut() {
+            *v = 0;
+        }
+
+        // Find with path-halving (no recursion, allocation-free).
+        #[inline(always)]
+        fn find(parent: &mut [u32], mut x: u32) -> u32 {
+            while parent[x as usize] != x {
+                let gp = parent[parent[x as usize] as usize];
+                parent[x as usize] = gp; // halve the path
+                x = gp;
+            }
+            x
+        }
+
+        // Single pass: count foreground cells (V) and 4-adjacent foreground pairs
+        // (E, right + down only so each undirected edge is seen once), unioning
+        // across every such edge.
+        let mut v_count = 0u32;
+        let mut e_count = 0u32;
+        for row in 0..h {
+            let base = row * w;
+            let down = if row == h - 1 { 0 } else { row + 1 };
+            let base_down = down * w;
+            for col in 0..w {
+                let idx = base + col;
+                if !self.is_foreground(idx, thresh) {
+                    continue;
+                }
+                v_count += 1;
+
+                // Right neighbour (toroidal).
+                let right = if col == w - 1 { 0 } else { col + 1 };
+                let ridx = base + right;
+                if self.is_foreground(ridx, thresh) {
+                    e_count += 1;
+                    let a = find(&mut self.uf_parent, idx as u32);
+                    let b = find(&mut self.uf_parent, ridx as u32);
+                    if a != b {
+                        self.uf_parent[a as usize] = b;
+                    }
+                }
+                // Down neighbour (toroidal).
+                let didx = base_down + col;
+                if self.is_foreground(didx, thresh) {
+                    e_count += 1;
+                    let a = find(&mut self.uf_parent, idx as u32);
+                    let b = find(&mut self.uf_parent, didx as u32);
+                    if a != b {
+                        self.uf_parent[a as usize] = b;
+                    }
+                }
+            }
+        }
+
+        // (On a 1-wide torus a cell's neighbour wraps back to itself, so `e` can
+        // exceed the true edge count; `loop_count` clamps for that degenerate grid.)
+
+        // Second pass: assign dense component ids in first-seen raster order and
+        // write the per-cell labels.
+        let mut next_id = 0u32;
+        for k in 0..n {
+            if !self.is_foreground(k, thresh) {
+                continue;
+            }
+            let root = find(&mut self.uf_parent, k as u32) as usize;
+            // Reuse `visited` as a root→dense-id map: 0 = unassigned. (visited is
+            // scratch shared with the reachability fill; we own it for this query.)
+            // We can't store id 0, so store id+1 and subtract on read.
+            if self.visited[root] == 0 {
+                next_id += 1;
+                self.visited[root] = next_id; // store the dense id at the root
+            }
+            self.component_labels[k] = self.visited[root];
+        }
+
+        (next_id, v_count, e_count)
+    }
+
+    /// Number of connected components in the thresholded foreground — high for a
+    /// scattered speckle of disconnected blobs, dropping toward `1` as the network
+    /// links up. `0` when there is no foreground at all. Fills `component_labels` as
+    /// a side effect (see [`Sim::component_labels`]). On-demand, read-only.
+    pub fn component_count(&mut self) -> u32 {
+        self.label_components().0
+    }
+
+    /// Number of independent loops (cycles) in the thresholded foreground — the
+    /// first Betti number `b1 = e - v + c` of the 4-connected grid graph, where `v`
+    /// is the foreground cell count, `e` the 4-adjacent foreground-pair count, and
+    /// `c` the component count. `0` for a tree or forest (no cycles), positive once
+    /// the network closes a loop. Clamped at `0` (it is non-negative for any planar
+    /// grid graph; the clamp guards the degenerate 1-wide-torus self-edge case).
+    /// Fills `component_labels` as a side effect. On-demand, read-only.
+    pub fn loop_count(&mut self) -> u32 {
+        let (c, v, e) = self.label_components();
+        // b1 = E - V + C. Saturating arithmetic clamps the degenerate case where a
+        // self-wrapping edge on a 1-wide torus would push E above V + C.
+        (e + c).saturating_sub(v)
+    }
+
+    /// Box-counting fractal (Minkowski–Bouligand) dimension of the thresholded
+    /// foreground. Counts occupied boxes at the power-of-two box sizes `1, 2, 4, …`
+    /// up to a fixed cap (and the field dimensions), then returns the
+    /// least-squares slope of `log(box_count)` vs `log(1/size)`. A sparse, filament-
+    /// like network lands near `1`; a space-filling one approaches `2`. `0.0` when
+    /// the foreground is empty or too small to fit two box sizes. On-demand,
+    /// read-only; reuses the `bfs_queue` scratch as the per-box occupancy grid.
+    pub fn fractal_dimension(&mut self) -> f32 {
+        let w = self.width;
+        let h = self.height;
+
+        let thresh = match self.foreground_threshold() {
+            Some(t) => t,
+            None => return 0.0,
+        };
+
+        // Sample box sizes 1, 2, 4, … up to FRACTAL_MAX_BOX but never larger than
+        // the field (a box bigger than the field gives a single box → no slope info).
+        let size_cap = FRACTAL_MAX_BOX.min(w).min(h);
+
+        // Accumulate the least-squares slope of y = log(count) vs x = log(1/size).
+        let mut sum_x = 0.0f64;
+        let mut sum_y = 0.0f64;
+        let mut sum_xx = 0.0f64;
+        let mut sum_xy = 0.0f64;
+        let mut samples = 0u32;
+
+        let mut size = 1usize;
+        while size <= size_cap {
+            let count = self.count_occupied_boxes(size, thresh);
+            if count > 0 {
+                let x = (1.0 / size as f64).ln();
+                let y = (count as f64).ln();
+                sum_x += x;
+                sum_y += y;
+                sum_xx += x * x;
+                sum_xy += x * y;
+                samples += 1;
+            }
+            size *= 2;
+        }
+
+        if samples < 2 {
+            return 0.0;
+        }
+        let nf = samples as f64;
+        let denom = nf * sum_xx - sum_x * sum_x;
+        if denom.abs() < 1e-12 {
+            return 0.0;
+        }
+        let slope = (nf * sum_xy - sum_x * sum_y) / denom;
+        slope as f32
+    }
+
+    /// Count how many `size × size` boxes (tiling the field from the top-left, the
+    /// last row/column of boxes clipped) contain at least one foreground cell. Used
+    /// by [`Sim::fractal_dimension`]; reuses `bfs_queue` as a per-box occupancy
+    /// bitmap (one `u32` flag per box). Allocation-free.
+    fn count_occupied_boxes(&mut self, size: usize, thresh: f32) -> u32 {
+        let w = self.width;
+        let h = self.height;
+        let bw = w.div_ceil(size); // boxes across
+        let bh = h.div_ceil(size); // boxes down
+        let nb = bw * bh;
+        // bfs_queue is width*height >= nb (since size >= 1 → nb <= w*h). Use its
+        // first `nb` entries as occupancy flags.
+        for f in self.bfs_queue[..nb].iter_mut() {
+            *f = 0;
+        }
+        for row in 0..h {
+            let base = row * w;
+            let by = row / size;
+            for col in 0..w {
+                if self.is_foreground(base + col, thresh) {
+                    let bx = col / size;
+                    self.bfs_queue[by * bw + bx] = 1;
+                }
+            }
+        }
+        let mut occupied = 0u32;
+        for &f in self.bfs_queue[..nb].iter() {
+            occupied += f;
+        }
+        occupied
+    }
+
+    /// Spatial autocorrelation length of the combined trail field — the grain size
+    /// of the pattern, in cells. Computes a radially-averaged spatial
+    /// autocorrelation of the mean-subtracted combined field at a handful of fixed
+    /// lags, averaging the four axial shifts (`±x`, `±y`, toroidal)
+    /// at each lag, and returns the lag at which the normalised correlation first
+    /// falls to `1/e` (≈ 0.368), linearly interpolated between bracketing lags. A
+    /// coarse field (broad blobs) stays correlated over many cells → a large length;
+    /// a fine field decorrelates within a cell or two → a small length. `0.0` for a
+    /// flat (zero-variance) field. On-demand, read-only; no scratch (streams the
+    /// field).
+    pub fn autocorrelation_length(&self) -> f32 {
+        let w = self.width;
+        let h = self.height;
+        let n = w * h;
+        if n == 0 {
+            return 0.0;
+        }
+
+        // Mean of the combined field.
+        let mut mean = 0.0f64;
+        for k in 0..n {
+            mean += (self.field[0][k] + self.field[1][k]) as f64;
+        }
+        mean /= n as f64;
+
+        // Variance (zero-lag autocovariance). A flat field has no length scale.
+        let mut var = 0.0f64;
+        for k in 0..n {
+            let d = (self.field[0][k] + self.field[1][k]) as f64 - mean;
+            var += d * d;
+        }
+        if var <= 0.0 {
+            return 0.0;
+        }
+        var /= n as f64;
+
+        // Normalised radially-averaged autocorrelation at each lag: the mean over the
+        // four axial toroidal shifts of the autocovariance, divided by the variance.
+        let combined = |idx: usize| (self.field[0][idx] + self.field[1][idx]) as f64 - mean;
+        let autocorr_at = |lag: usize| -> f64 {
+            if lag == 0 {
+                return 1.0;
+            }
+            let mut cov = 0.0f64;
+            for row in 0..h {
+                let base = row * w;
+                // Horizontal shift by `lag` (toroidal).
+                for col in 0..w {
+                    let sc = (col + lag) % w;
+                    cov += combined(base + col) * combined(base + sc);
+                }
+                // Vertical shift by `lag` (toroidal).
+                let srow = (row + lag) % h;
+                let sbase = srow * w;
+                for col in 0..w {
+                    cov += combined(base + col) * combined(sbase + col);
+                }
+            }
+            // Two shift directions × n samples each; the other two axial shifts
+            // (`-x`, `-y`) give identical sums by toroidal symmetry, so averaging the
+            // two computed directions equals averaging all four.
+            cov / (2.0 * n as f64) / var
+        };
+
+        // Walk the lags until the correlation drops below 1/e, then interpolate.
+        const INV_E: f64 = 0.367_879_441_171_442_33;
+        let mut prev_lag = 0.0f64;
+        let mut prev_corr = 1.0f64;
+        for &lag in AUTOCORR_LAGS.iter() {
+            if lag >= w && lag >= h {
+                break;
+            }
+            let corr = autocorr_at(lag);
+            if corr <= INV_E {
+                // Linear interpolation between (prev_lag, prev_corr) and (lag, corr).
+                let span = prev_corr - corr;
+                let frac = if span.abs() < 1e-12 {
+                    0.0
+                } else {
+                    (prev_corr - INV_E) / span
+                };
+                let length = prev_lag + frac * (lag as f64 - prev_lag);
+                return length as f32;
+            }
+            prev_lag = lag as f64;
+            prev_corr = corr;
+        }
+        // Never fell to 1/e within the sampled lags → the grain is at least the last
+        // lag wide; report that lag as a lower bound.
+        prev_lag as f32
+    }
+
+    /// Read-only view of the per-cell component-label buffer (row-major,
+    /// `len == width * height`): `0` = background, else a `1..=component_count`
+    /// component id. Filled by the most recent [`Sim::component_count`] /
+    /// [`Sim::loop_count`] call; all-zero before any such call. `petri-wasm` hands
+    /// JS a zero-copy pointer into this buffer for a component-map overlay.
+    pub fn component_labels(&self) -> &[u32] {
+        &self.component_labels
     }
 
     /// Advance the simulation one tick: every agent senses, steers, moves
@@ -2771,6 +3159,207 @@ mod tests {
         assert!(
             overlap_avoid < overlap_base,
             "mutual avoidance should reduce species overlap: avoid {overlap_avoid} >= base {overlap_base}"
+        );
+    }
+
+    // --- Structure metrics ---
+
+    /// Paint a strong trail blob (species 0) into a rectangle of the field, well
+    /// above any threshold. Helper for the hand-built structure-metric fields.
+    fn paint_block(sim: &mut Sim, x0: usize, x1: usize, y0: usize, y1: usize) {
+        let w = sim.width();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                sim.field[0][y * w + x] = 10.0;
+            }
+        }
+    }
+
+    /// `component_count` is high for scattered, disconnected speckle and drops to `1`
+    /// once the blobs are bridged into a single network. Built on a hand-painted
+    /// field (no obstacles), so the metric is exercised in isolation. The label
+    /// buffer is consistent with the count (ids in `1..=count`, background `0`).
+    #[test]
+    fn component_count_tracks_connectivity() {
+        let mut sim = Sim::with_capacity(64, 64, 1, 0);
+        sim.clear_obstacles();
+        sim.set_network_threshold(0.5); // a clean, decisive foreground cut
+
+        // Empty field: no foreground, no components.
+        assert_eq!(sim.component_count(), 0);
+        assert!(sim.component_labels().iter().all(|&l| l == 0));
+
+        // Four well-separated blobs → four components.
+        paint_block(&mut sim, 4, 8, 4, 8);
+        paint_block(&mut sim, 50, 54, 4, 8);
+        paint_block(&mut sim, 4, 8, 50, 54);
+        paint_block(&mut sim, 50, 54, 50, 54);
+        let c4 = sim.component_count();
+        assert_eq!(c4, 4, "four separated blobs must be four components");
+
+        // Labels are a valid map: background 0, foreground ids in 1..=count, and the
+        // distinct non-zero ids equal the count.
+        let labels = sim.component_labels();
+        let mut ids: Vec<u32> = labels.iter().copied().filter(|&l| l != 0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len() as u32, c4, "distinct labels must equal the count");
+        assert!(
+            ids.iter().all(|&id| id >= 1 && id <= c4),
+            "labels must lie in 1..=count"
+        );
+
+        // Bridge everything with a full cross of trail → a single component.
+        paint_block(&mut sim, 0, 63, 30, 32); // horizontal bar
+        paint_block(&mut sim, 30, 32, 0, 63); // vertical bar
+                                              // Re-link the corner blobs to the cross.
+        paint_block(&mut sim, 8, 31, 6, 8);
+        paint_block(&mut sim, 6, 8, 8, 31);
+        paint_block(&mut sim, 31, 52, 6, 8);
+        paint_block(&mut sim, 52, 54, 8, 31);
+        paint_block(&mut sim, 8, 31, 52, 54);
+        paint_block(&mut sim, 6, 8, 31, 52);
+        paint_block(&mut sim, 31, 52, 52, 54);
+        paint_block(&mut sim, 52, 54, 31, 52);
+        assert_eq!(
+            sim.component_count(),
+            1,
+            "a fully bridged field must be one component"
+        );
+    }
+
+    /// `loop_count` is `0` for a tree (a `+`-shaped trail with no enclosed cycle) and
+    /// strictly positive for a field containing a closed ring.
+    #[test]
+    fn loop_count_detects_cycles() {
+        let mut sim = Sim::with_capacity(48, 48, 1, 0);
+        sim.clear_obstacles();
+        sim.set_network_threshold(0.5);
+
+        // A plus/cross drawn 1 cell thick: two crossing lines share a center but
+        // enclose no area → a tree (no independent cycle). (A *thick* bar would
+        // enclose many tiny pixel loops within the band itself, so the tree must be
+        // single-cell-wide lines.)
+        paint_block(&mut sim, 4, 43, 24, 24); // horizontal line
+        paint_block(&mut sim, 24, 24, 4, 43); // vertical line
+        assert_eq!(sim.component_count(), 1, "the cross is one component");
+        assert_eq!(sim.loop_count(), 0, "a 1-thick cross encloses no loop");
+
+        // A hollow square ring of 1-cell-thick lines enclosing an empty interior →
+        // exactly one independent loop.
+        let mut ring = Sim::with_capacity(48, 48, 1, 0);
+        ring.clear_obstacles();
+        ring.set_network_threshold(0.5);
+        paint_block(&mut ring, 10, 38, 10, 10); // top edge
+        paint_block(&mut ring, 10, 38, 38, 38); // bottom edge
+        paint_block(&mut ring, 10, 10, 10, 38); // left edge
+        paint_block(&mut ring, 38, 38, 10, 38); // right edge
+        assert_eq!(ring.component_count(), 1, "the ring is one component");
+        assert_eq!(
+            ring.loop_count(),
+            1,
+            "a single closed ring is exactly one independent loop"
+        );
+    }
+
+    /// `fractal_dimension` lands in a sane range (≈1–2) and is higher for a
+    /// space-filling field than for a sparse, thin one.
+    #[test]
+    fn fractal_dimension_orders_by_space_filling() {
+        // Sparse: a single thin horizontal line (≈ 1D).
+        let mut thin = Sim::with_capacity(64, 64, 1, 0);
+        thin.clear_obstacles();
+        thin.set_network_threshold(0.5);
+        paint_block(&mut thin, 0, 63, 32, 32);
+        let d_thin = thin.fractal_dimension();
+
+        // Space-filling: the whole field is foreground (≈ 2D).
+        let mut full = Sim::with_capacity(64, 64, 1, 0);
+        full.clear_obstacles();
+        full.set_network_threshold(0.5);
+        paint_block(&mut full, 0, 63, 0, 63);
+        let d_full = full.fractal_dimension();
+
+        assert!(
+            (0.5..=2.1).contains(&d_thin),
+            "thin-line fractal dim {d_thin} out of sane range"
+        );
+        assert!(
+            (0.5..=2.1).contains(&d_full),
+            "full-field fractal dim {d_full} out of sane range"
+        );
+        assert!(
+            d_full > d_thin,
+            "a space-filling field ({d_full}) must out-dimension a thin line ({d_thin})"
+        );
+        // Empty field → 0.
+        let mut empty = Sim::with_capacity(32, 32, 1, 0);
+        empty.clear_obstacles();
+        assert_eq!(empty.fractal_dimension(), 0.0);
+    }
+
+    /// `autocorrelation_length` is larger for a coarse field (broad blobs) than for a
+    /// fine one (rapidly alternating stripes), and `0.0` for a flat field.
+    #[test]
+    fn autocorrelation_length_tracks_grain() {
+        let w = 64usize;
+        let h = 64usize;
+
+        // Coarse: broad blocks — a few wide stripes (period 32 → stays correlated far).
+        let mut coarse = Sim::with_capacity(w, h, 1, 0);
+        for y in 0..h {
+            for x in 0..w {
+                // Two big bands: left half high, right half low.
+                coarse.field[0][y * w + x] = if x < w / 2 { 10.0 } else { 0.0 };
+            }
+        }
+        let l_coarse = coarse.autocorrelation_length();
+
+        // Fine: alternating single-cell stripes (period 2 → decorrelates immediately).
+        let mut fine = Sim::with_capacity(w, h, 1, 0);
+        for y in 0..h {
+            for x in 0..w {
+                fine.field[0][y * w + x] = if x % 2 == 0 { 10.0 } else { 0.0 };
+            }
+        }
+        let l_fine = fine.autocorrelation_length();
+
+        assert!(
+            l_coarse > l_fine,
+            "coarse grain ({l_coarse}) must exceed fine grain ({l_fine})"
+        );
+        assert!(l_coarse > 0.0 && l_fine >= 0.0);
+
+        // Flat field → no length scale.
+        let flat = Sim::with_capacity(32, 32, 1, 0);
+        assert_eq!(flat.autocorrelation_length(), 0.0);
+    }
+
+    /// The structure metrics are read-only: computing every one of them does not
+    /// perturb the trail fields (the determinism golden is reproduced after the
+    /// metrics are queried mid-stream).
+    #[test]
+    fn structure_metrics_are_read_only() {
+        const GOLDEN_SEED: u64 = 0xABCD_1234;
+        const TICKS: usize = 60;
+        const GOLDEN_CHECKSUM: u64 = 0x8de7_8e52_803c_7618;
+
+        let mut sim = Sim::new(128, 128, GOLDEN_SEED);
+        for t in 0..TICKS {
+            sim.tick();
+            // Hammer every metric between ticks; none may mutate sim state.
+            if t % 7 == 0 {
+                let _ = sim.component_count();
+                let _ = sim.loop_count();
+                let _ = sim.fractal_dimension();
+                let _ = sim.autocorrelation_length();
+                let _ = sim.component_labels().len();
+            }
+        }
+        assert_eq!(
+            checksum_all(&sim),
+            GOLDEN_CHECKSUM,
+            "querying structure metrics must not perturb the sim (read-only)"
         );
     }
 }

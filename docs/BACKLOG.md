@@ -108,12 +108,12 @@ The next-task queue. Open this first each session, do the top unchecked item, ti
 - [x] app: **Cross-species sensing** Tweakpane folder (two off-diagonal sliders, guarded writes) + **Territories** (mutual avoidance) and **Predator/prey** (asymmetric pursuit) presets; scenario URL codec carries `crossSense`
 - [x] **Gate check:** verified in-browser — Territories keeps the two colors to separate domains, Predator/prey shows magenta tracking cyan; segregation measured 5× in the sim; coupling links round-trip; zero console errors
 
-## M9 — Structure metrics (gate: a decay sweep shows component count collapse — a measured phase transition)
-- [ ] petri-core: connected components & loops (union-find / Euler characteristic), trail length & branching (skeleton), fractal dimension (box-counting), autocorrelation length — read-only, pre-allocated scratch
-- [ ] petri-core: Lyapunov-style seed-perturbation divergence (perturb seed by 1, measure field divergence per tick)
-- [ ] petri-wasm: structure-metric getters
-- [ ] app: new metric series + overlays (component map, skeleton, long-exposure)
-- [ ] **Gate check:** the component-count series collapses at a `decay` threshold, on screen and in CSV
+## M9 — Structure metrics ✅ gate met — a live decay sweep collapses the component count (14→4→2) while grain & fractal dimension grow: a measured phase transition
+- [x] petri-core: read-only, on-demand reductions over the thresholded foreground — connected components (+ a per-cell label buffer), independent loops (`b1 = E−V+C`), box-counting fractal dimension, autocorrelation grain length; one union-find pass yields components + labels + E/V; pre-allocated scratch, no tick change → **all goldens unchanged** (32/32 tests)
+- [x] petri-wasm: `component_count`/`loop_count`/`fractal_dimension`/`autocorrelation_length` + `component_labels_ptr`/`component_labels_len`
+- [x] app: component-count sparkline row + loops/D/grain readout + four new CSV/JSON columns (structure metrics sampled on a throttled 20-frame cadence to protect fps); a **Render mode** selector adds a **component map** (color by label) and **long-exposure** (time-integrated) overlay
+- [x] **Gate check:** verified in-browser — driving `decay` 0.75→0.985 collapses components 14→4 (then 2), autocorr 5.8→28.8 cells, fractal D 1.40→1.66; component-map overlay colors components to match the count; long-exposure integrates; zero console errors
+- [ ] follow-up (deferred): skeleton-based trail length & branching (node degrees), and a Lyapunov-style seed-perturbation divergence (needs a cloneable twin `Sim`) — both read-only additions in the same vein
 
 ## M10 — Headless parameter sweep (gate: a reproducible phase-diagram CSV locating a bifurcation)
 - [ ] petri-core: a native batch runner (binary/example) — vary 1–2 knobs × N values × M seeds, no browser, record an order parameter, emit CSV

@@ -151,6 +151,10 @@ identical to one without geography and the golden-checksum test is unchanged.
 - **Geography:** the obstacle mask uploads as an `R8` texture; wall cells render as a dim slate
   underlay kept below the bloom threshold (no glow), and each endpoint draws an additive amber
   ring so the sources/sinks read at a glance.
+- **Render modes:** beyond the default tone-map, a *component map* (each connected component a
+  distinct hue from the labels buffer, an `R32UI` texture) and *long-exposure* (a time-integrated
+  `RGBA16F` accumulator showing the network's history) turn the renderer into a measurement
+  display. Default is the tone-map; the others are opt-in.
 - Beauty bar: smooth gradients, soft additive glow, no hard pixel edges at the target zoom.
 
 ## Measurement & sharing (petri-render + petri-wasm)
@@ -168,6 +172,11 @@ is unperturbed and determinism holds), plus point queries (`trail_at`, `food_at`
   `network_threshold` and flood-filled (4-connected, toroidal) from endpoint 0 over pre-allocated
   scratch; `endpoints_connected` (how many wells the network spans) and `network_cost` (cells in
   the connecting structure) read out whether — and how cheaply — the maze is solved.
+- **Structure** — the same on-demand, read-only pattern quantifies *form*, not just quantity,
+  over the thresholded foreground: connected components (with a per-cell label buffer feeding the
+  component-map render mode), independent loops (the grid graph's first Betti number
+  `b1 = E − V + C`), box-counting fractal dimension, and the autocorrelation grain length. A slow
+  `decay` sweep collapses the component count and grows the grain — a measured phase transition.
 - **Inspector** — hovering reads the trail/food under the cursor and the nearest agent's
   species and energy.
 - **Sharing & presets** — a named **preset gallery** loads classical scenarios (capillary mesh,
@@ -278,6 +287,15 @@ scenario needs. The URL hash encodes the endpoint list and a compact tag for pro
 hand-painted masks are deliberately not shareable. *Rejected:* a Rust-side scenario format and a
 second (de)serialization path across the wasm boundary (the app already owns the parameter
 surface and the URL codec); packing the raw mask into the URL (too large).
+
+**D16 — Structure metrics are read-only on-demand reductions, like reachability; no tick cost.**
+Components, loops, fractal dimension, and grain length are computed only when sampled (the
+renderer throttles them off the per-frame budget), over pre-allocated scratch, never inside
+`tick` — so the hot loop, the no-alloc invariant, and every golden checksum are untouched. One
+union-find pass yields the components, the per-cell labels, and the edge/vertex counts for the
+loop Betti number. *Rejected:* folding them into the tick (heavy, and they're wanted at UI
+cadence, not tick cadence); a sensitivity (Lyapunov) divergence for now — it needs a cloneable
+twin `Sim` and is tracked as a follow-up.
 
 ## Out of current scope (not deleted)
 
