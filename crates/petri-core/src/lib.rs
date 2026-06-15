@@ -1357,7 +1357,8 @@ impl Sim {
 
     /// How many endpoints (including endpoint 0) are reachable from endpoint 0 along
     /// the thresholded combined trail network (open cells only, toroidal). `0` if
-    /// there are no endpoints. See [`Sim::reachability`]. On-demand, read-only.
+    /// there are no endpoints. Backed by the private `reachability` reduction. On-demand,
+    /// read-only.
     pub fn endpoints_connected(&mut self) -> u32 {
         self.reachability().0
     }
