@@ -25,6 +25,10 @@ export interface Scenario {
   geometry: GeometryTag;
   endpoints: Endpoint[];
   crossSense?: CrossSense;
+  // Optional per-species evolution of the heritable sensor_distance trait. When
+  // omitted, `applyScenario` still sets the full state to disabled / strength 0,
+  // so switching away from an evolving preset turns evolution off cleanly.
+  evolution?: { enabled: [boolean, boolean]; mutation: [number, number] };
 }
 
 export interface Preset {
@@ -254,6 +258,22 @@ export const PRESETS: Preset[] = [
       geometry: "none",
       endpoints: [],
       crossSense: { s01: -0.8, s10: 0.8 },
+    },
+  },
+  {
+    id: "evolution",
+    name: "Evolution",
+    caption: "Cyan's sensor reach is heritable and mutates at birth — watch the trait drift.",
+    scenario: {
+      // The shared-food world, but cyan's sensor_distance is heritable: births
+      // mutate it (strength ~1 cell) and selection lets the trait distribution
+      // drift away from the default 7 cells. Open the trait sparkline / Trait-map
+      // render mode to watch it. Magenta is left non-evolving as a control.
+      species: [s0(), s1()],
+      network_threshold: DEFAULT_THRESHOLD,
+      geometry: "none",
+      endpoints: [],
+      evolution: { enabled: [true, false], mutation: [1.0, 0.0] },
     },
   },
 ];

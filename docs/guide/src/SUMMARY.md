@@ -9,6 +9,7 @@
 - [Ecology and population dynamics](./ecology.md)
 - [Two species](./two-species.md)
 - [Cross-species sensing](./cross-species.md)
+- [Evolution: heritable traits](./evolution.md)
 - [Sources, sinks & mazes](./geography.md)
 - [The preset gallery](./presets.md)
 - [Structure metrics](./structure-metrics.md)

@@ -121,9 +121,13 @@ The next-task queue. Open this first each session, do the top unchecked item, ti
 - [x] petri-core: `std::thread::scope` parallelism over the independent runs (default 20×6×3000 ticks at 256² in ~21 s, ~11 cores); results scatter back by job index so the output is thread-count-independent and byte-identical per config
 - [x] **Gate check:** the default `decay` sweep collapses components ~17→~2 at the consolidation threshold; CSV + SVG reproducible byte-for-byte; goldens unchanged (32 tests). Figure embedded in the guide
 
-## M11 — Evolution: heritable traits (gate: a trait distribution drifts over a run; same seed reproduces it)
-- [ ] petri-core: on reproduction, copy parent params with a small mutation instead of the species default; mutation drawn from the sim RNG (determinism preserved)
-- [ ] petri-core: trait-distribution metric; determinism test for the evolutionary trajectory
-- [ ] petri-wasm: trait-distribution getters
-- [ ] app: trait/age coloring + a trait-distribution readout
-- [ ] **Gate check:** under a fixed landscape a trait distribution measurably shifts; reset + same seed reproduces the drift
+## M11 — Evolution: heritable traits ✅ gate met — the trait distribution drifts (µ 5.7→9.3 cells live; 7.0→4.94 in the native test) and replays identically from the seed
+- [x] petri-core: per-agent heritable `sensor_distance` (SoA); on reproduction the child inherits the parent's value + a seeded-RNG Gaussian mutation (`mutation_strength`, clamped [1,32]); fixed RNG order; gated `evolution_active` so default-off is byte-identical (all baseline goldens unchanged)
+- [x] petri-core: trait-distribution metrics (`trait_mean`/`std`/`min`/`max`, `agent_trait`) + a gated `trait_field` for the trait-map view; new evolution determinism golden + a drift+reproducibility test (38 tests)
+- [x] petri-wasm: `set_evolution`/`evolution_enabled`, `set_mutation_strength`/`mutation_strength`, trait getters, `trait_field_ptr`/`len`
+- [x] app: per-species Evolution controls (enable + mutation), a trait sparkline (mean ±σ) + readout + CSV columns, a **Trait map** render mode (short→long reach gradient), an **Evolution** preset; scenario codec carries the evolution state
+- [x] **Gate check:** verified in-browser — loading the Evolution preset drifts `trait µ 5.7 ± 4.3 → 9.3 ± 13.1 cells` over a run (evolving cyan outcompetes the non-evolving magenta control), the trait map colors strategies spatially, zero console errors; reset + same seed reproduces the trajectory (native test)
+
+## Deferred follow-ups (post-arc, not yet scheduled)
+- [ ] persistent, pruned shortest-path maze solve — needs an adaptive flux-based tube model (Tero-style), not tuning (see M6 notes)
+- [ ] skeleton-based trail length & branching, and a Lyapunov-style seed-perturbation divergence (needs a cloneable twin `Sim`) — read-only additions in the M9 vein

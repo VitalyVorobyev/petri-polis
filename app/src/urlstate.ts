@@ -50,6 +50,14 @@ export interface CrossSense {
   s10: number;
 }
 
+// Evolution state per species: whether the heritable sensor_distance trait is
+// under selection, and the per-birth mutation strength (cells). `[species 0,
+// species 1]`. Disabled / strength 0 by default — older links decode to off.
+export interface Evolution {
+  enabled: [boolean, boolean];
+  mutation: [number, number];
+}
+
 export interface SharedState {
   seed: number;
   species: SpeciesState[];
@@ -57,6 +65,7 @@ export interface SharedState {
   geometry: GeometryTag;
   endpoints: Endpoint[];
   crossSense: CrossSense;
+  evolution: Evolution;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +110,10 @@ export function readSharedState(sim: Sim, seed: number, geometry: GeometryTag): 
     geometry,
     endpoints,
     crossSense: { s01: sim.cross_sense(0, 1), s10: sim.cross_sense(1, 0) },
+    evolution: {
+      enabled: [sim.evolution_enabled(0), sim.evolution_enabled(1)],
+      mutation: [sim.mutation_strength(0), sim.mutation_strength(1)],
+    },
   };
 }
 
@@ -155,6 +168,8 @@ function validateState(raw: unknown): SharedState | null {
   }
   // crossSense is tolerant: older links that predate it decode to identity (0/0).
   if (obj.crossSense !== undefined && !isCrossSense(obj.crossSense)) return null;
+  // evolution is tolerant: older links that predate it decode to disabled.
+  if (obj.evolution !== undefined && !isEvolution(obj.evolution)) return null;
 
   // Normalize so callers can rely on the optional fields being present.
   // food_attraction defaults to 0 on any species that predates it.
@@ -163,6 +178,7 @@ function validateState(raw: unknown): SharedState | null {
     food_attraction: typeof sp.food_attraction === "number" ? sp.food_attraction : 0,
   }));
   const cs = obj.crossSense as Partial<CrossSense> | undefined;
+  const evo = obj.evolution as Partial<Evolution> | undefined;
   const normalized: SharedState = {
     seed: obj.seed as number,
     species,
@@ -173,6 +189,13 @@ function validateState(raw: unknown): SharedState | null {
     crossSense: {
       s01: typeof cs?.s01 === "number" ? cs.s01 : 0,
       s10: typeof cs?.s10 === "number" ? cs.s10 : 0,
+    },
+    evolution: {
+      enabled: [evo?.enabled?.[0] === true, evo?.enabled?.[1] === true],
+      mutation: [
+        typeof evo?.mutation?.[0] === "number" ? evo.mutation[0] : 0,
+        typeof evo?.mutation?.[1] === "number" ? evo.mutation[1] : 0,
+      ],
     },
   };
   return normalized;
@@ -213,5 +236,20 @@ function isCrossSense(v: unknown): v is CrossSense {
   // Both fields are tolerant (older links omit either); only reject wrong types.
   if (obj.s01 !== undefined && typeof obj.s01 !== "number") return false;
   if (obj.s10 !== undefined && typeof obj.s10 !== "number") return false;
+  return true;
+}
+
+function isEvolution(v: unknown): v is Evolution {
+  if (typeof v !== "object" || v === null) return false;
+  const obj = v as Record<string, unknown>;
+  // Both fields are tolerant (older links omit either); only reject wrong shapes.
+  if (obj.enabled !== undefined) {
+    if (!Array.isArray(obj.enabled)) return false;
+    for (const e of obj.enabled) if (e !== undefined && typeof e !== "boolean") return false;
+  }
+  if (obj.mutation !== undefined) {
+    if (!Array.isArray(obj.mutation)) return false;
+    for (const m of obj.mutation) if (m !== undefined && typeof m !== "number") return false;
+  }
   return true;
 }

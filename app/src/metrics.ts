@@ -18,6 +18,11 @@ export interface MetricSample {
   loopCount: number; // independent loops (first Betti number b1) of the foreground
   fractalDimension: number; // box-counting dimension of the foreground, ~1..2
   autocorrLength: number; // trail-field autocorrelation (grain) length, in cells
+  // Evolution — heritable sensor_distance trait, per species (cells). Mean and
+  // std are 0 for a species that isn't evolving (no live trait spread). The mean
+  // drift over time with the ±std band is the evolution gate signal.
+  traitMean: [number, number]; // mean evolved sensor_distance, species 0 / 1
+  traitStd: [number, number]; // std-dev of the evolved sensor_distance, species 0 / 1
 }
 
 const RING_CAP = 600;
@@ -92,8 +97,8 @@ export function drawSparklines(
 
   const samples = buf.ordered();
 
-  // Layout: 6 sparkline rows (each CELL_H px tall with a GAP between) followed
-  // by a compact two-line structure-metrics readout.
+  // Layout: 6 sparkline rows (each CELL_H px tall with a GAP between), a compact
+  // two-line structure-metrics readout, then a trait-distribution row (evolution).
   const PAD_L = 6;
   const PAD_R = 6;
   const PAD_T = 6;
@@ -261,6 +266,96 @@ export function drawSparklines(
     );
     drawLabel(ctx, PAD_L, top + LABEL_H, `autocorr ${latest.autocorrLength.toFixed(1)} cells`);
   }
+
+  // --- Row 7: Evolved trait (sensor distance) µ ± σ over time ---------------
+  // The heritable sensor_distance, plotted on a fixed [1, 32]-cell axis (the
+  // trait's clamp range) so the absolute drift is legible. For each evolving
+  // species (non-zero std somewhere in the window) draw a faint ±σ band and the
+  // mean line in the species colour. Flat at the bottom when nothing evolves.
+  {
+    const top = rowY(7);
+    const plotY = top + LABEL_H;
+    const plotH = CELL_H - LABEL_H;
+    const TRAIT_MIN = 1;
+    const TRAIT_MAX = 32;
+    const norm = (v: number) => (v - TRAIT_MIN) / (TRAIT_MAX - TRAIT_MIN);
+
+    // Label: show µ ± σ for whichever species is currently evolving (std > 0),
+    // preferring species 0. Falls back to a hint when nothing is evolving.
+    const evo0 = latest.traitStd[0] > 0 || latest.traitMean[0] > 0;
+    const evo1 = latest.traitStd[1] > 0 || latest.traitMean[1] > 0;
+    let label = "trait  (evolution off)";
+    if (evo0) {
+      label = `trait µ ${latest.traitMean[0].toFixed(1)} ± ${latest.traitStd[0].toFixed(1)} cells`;
+    } else if (evo1) {
+      label = `trait µ ${latest.traitMean[1].toFixed(1)} ± ${latest.traitStd[1].toFixed(1)} cells`;
+    }
+    drawLabel(ctx, PAD_L, top, label);
+
+    const speciesColors = ["#22d3c8", "#d943a8"] as const;
+    for (let sp = 0; sp < 2; sp++) {
+      const evolving = samples.some((s) => s.traitStd[sp] > 0 || s.traitMean[sp] > 0);
+      if (!evolving) continue;
+      drawBand(
+        ctx,
+        samples,
+        PAD_L,
+        plotY,
+        plotW,
+        plotH,
+        (s) => norm(s.traitMean[sp] - s.traitStd[sp]),
+        (s) => norm(s.traitMean[sp] + s.traitStd[sp]),
+        speciesColors[sp],
+      );
+      drawLine(
+        ctx,
+        samples,
+        PAD_L,
+        plotY,
+        plotW,
+        plotH,
+        (s) => norm(s.traitMean[sp]),
+        speciesColors[sp],
+        1.4,
+      );
+    }
+  }
+}
+
+// Draw a translucent vertical band between two value series (a ±σ envelope).
+// `lo`/`hi` return normalised [0,1] heights; the band is clamped to the box.
+function drawBand(
+  ctx: CanvasRenderingContext2D,
+  samples: MetricSample[],
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  lo: (s: MetricSample) => number,
+  hi: (s: MetricSample) => number,
+  color: string,
+): void {
+  if (samples.length < 2) return;
+  const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
+  ctx.beginPath();
+  // Top edge (hi) left → right.
+  for (let i = 0; i < samples.length; i++) {
+    const px = x + (i / (samples.length - 1)) * w;
+    const py = y + h - clamp01(hi(samples[i])) * h;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  // Bottom edge (lo) right → left, closing the polygon.
+  for (let i = samples.length - 1; i >= 0; i--) {
+    const px = x + (i / (samples.length - 1)) * w;
+    const py = y + h - clamp01(lo(samples[i])) * h;
+    ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.16;
+  ctx.fill();
+  ctx.globalAlpha = 1.0;
 }
 
 // Draw a thin sparkline within a (x, y, w, h) box.
@@ -331,7 +426,8 @@ function fmtSI(n: number): string {
 
 const CSV_HEADER =
   "tick,pop0,pop1,mass0,mass1,food_total,food_coverage," +
-  "component_count,loop_count,fractal_dimension,autocorrelation_length";
+  "component_count,loop_count,fractal_dimension,autocorrelation_length," +
+  "trait_mean0,trait_std0,trait_mean1,trait_std1";
 
 function sampleToCSV(s: MetricSample): string {
   return [
@@ -346,6 +442,10 @@ function sampleToCSV(s: MetricSample): string {
     s.loopCount,
     s.fractalDimension.toFixed(4),
     s.autocorrLength.toFixed(4),
+    s.traitMean[0].toFixed(4),
+    s.traitStd[0].toFixed(4),
+    s.traitMean[1].toFixed(4),
+    s.traitStd[1].toFixed(4),
   ].join(",");
 }
 

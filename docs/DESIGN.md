@@ -137,6 +137,21 @@ All of it is additive: with no walls, no endpoints, and `food_attraction = 0` (t
 new branches are never entered — no extra PRNG draw, no food term — so a run is bit-for-bit
 identical to one without geography and the golden-checksum test is unchanged.
 
+## Evolution (heritable traits)
+
+`sensor_distance` can be made **heritable**: with evolution enabled for a species, each agent
+carries its own value (a per-agent SoA field) and senses with it, and on reproduction the child
+inherits the parent's value plus a Gaussian mutation (std `mutation_strength`, drawn from the sim
+RNG, clamped to `[1, 32]`). Selection by the food/geometry landscape then shifts the population's
+trait distribution — heredity + mutation + differential survival, no learned behaviour. Enabling a
+species seeds its agents at the species default (a monomorphic start) so the drift is visible from
+zero. Evolution is **off by default and byte-identical when off** — the per-agent sense path and
+the mutation draw are gated on an `evolution_active` flag, so every golden checksum is unchanged;
+only when enabled does the trajectory diverge (it has its own pinned golden). Because the mutation
+comes from the seeded PRNG, an evolutionary run is fully reproducible: same seed → same trajectory,
+mutation for mutation. A gated `trait_field` (the local evolved trait, latest-deposit-wins) feeds
+the trait-map render mode, and `trait_mean`/`trait_std` per species feed the live drift readout.
+
 ## Rendering (petri-render)
 
 - Each species' trail is single-channel `f32` → upload as an `R32F` texture each frame.
@@ -152,9 +167,10 @@ identical to one without geography and the golden-checksum test is unchanged.
   underlay kept below the bloom threshold (no glow), and each endpoint draws an additive amber
   ring so the sources/sinks read at a glance.
 - **Render modes:** beyond the default tone-map, a *component map* (each connected component a
-  distinct hue from the labels buffer, an `R32UI` texture) and *long-exposure* (a time-integrated
-  `RGBA16F` accumulator showing the network's history) turn the renderer into a measurement
-  display. Default is the tone-map; the others are opt-in.
+  distinct hue from the labels buffer, an `R32UI` texture), *long-exposure* (a time-integrated
+  `RGBA16F` accumulator showing the network's history), and a *trait map* (the network colored by
+  each cell's local evolved `sensor_distance`) turn the renderer into a measurement display.
+  Default is the tone-map; the others are opt-in.
 - Beauty bar: smooth gradients, soft additive glow, no hard pixel edges at the target zoom.
 
 ## Measurement & sharing (petri-render + petri-wasm)
@@ -305,6 +321,15 @@ parallelizes the independent runs), no backend. Runs scatter their results back 
 the thread count never changes the output: the same config yields a byte-identical CSV. *Rejected:*
 a plotting crate or a Python/notebook step (a second toolchain for a figure that's a few hundred
 lines of SVG); folding sweeps into the app (they're offline batch work, not interactive).
+
+**D18 — Evolution is one opt-in heritable trait, off by default, deterministic.** Only
+`sensor_distance` is heritable (one legible 1-D distribution to watch drift, per the cut-list): a
+per-agent SoA value, inherited with a seeded-RNG Gaussian mutation on reproduction, gated so the
+default run is byte-identical and every prior golden is unchanged. Selection by the landscape does
+the rest — no RL, no learned policy, and the seeded PRNG makes the whole trajectory reproducible.
+*Rejected:* evolving the entire `Params` vector at once (illegible noise); a learned/gradient
+strategy (out of scope and non-deterministic); making evolution always-on (it would change the
+default dynamics and add an RNG draw per birth).
 
 ## Out of current scope (not deleted)
 
