@@ -9,8 +9,9 @@ endpoint food sources, chemotaxis, and the reachability metric — the Physarum-
 demo; M7 added a one-click gallery of classical scenarios that round-trip as shareable links; M8
 added cross-species sensing (a signed 2×2 matrix) for territories and predator/prey; M9 added
 structure metrics (components, loops, fractal dimension, grain) and made them visible as
-measured phase transitions. It all publishes to GitHub Pages (live demo + guide + API docs).
-**M10–M11 are the remaining lab phase**, sequenced in payoff order.
+measured phase transitions; M10 added a headless parameter sweep that emits reproducible
+phase-diagram figures. It all publishes to GitHub Pages (live demo + guide + API docs).
+**M11 is the last remaining lab milestone.**
 
 **From toy to lab.** The toy proves emergence is fun and reproducible; the lab proves the toy
 *computes* — it reproduces classical complex-systems demos as one-click presets — and lets you
@@ -98,12 +99,13 @@ Lyapunov-style divergence are tracked as follow-ups.)
 **Gate:** a slow `decay` sweep shows the component count collapse at a threshold — a measured
 phase transition, on screen and in the exported CSV.
 
-## M10 — Headless parameter sweep: phase diagrams
-A native `petri-core` batch runner (no browser): vary one or two knobs across N values × M
-seeds, record an order parameter (component count, coexistence, oscillation period), and emit a
-CSV/figure.
-**Gate:** a reproducible phase-diagram CSV — and a plotted figure — locating a regime boundary
-(a bifurcation).
+## M10 — Headless parameter sweep: phase diagrams ✅ done
+A native, dependency-free `petri-core` binary (`src/bin/sweep.rs`): vary one or two knobs across
+N values × M seeds, record an order parameter (component count, with trail mass + coexistence
+companions), and emit a CSV plus a hand-rolled SVG phase diagram (a heatmap in 2-D);
+`std::thread` parallelizes the independent runs. Same config → byte-identical output.
+**Gate:** a reproducible phase-diagram CSV — and a plotted figure — locating a regime boundary;
+a `decay` sweep collapses the component count from ~17 to ~2 at the consolidation threshold.
 
 ## M11 — Evolution: heritable traits
 On reproduction, copy the parent's params with a small mutation instead of the species default,

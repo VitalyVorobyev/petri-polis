@@ -11,6 +11,10 @@
 # Generated mdBook output (rebuilt from docs/guide/src)
 /docs/guide/book
 
+# Sweep tool outputs (the curated figure lives in docs/guide/src/images/)
+/sweep.csv
+/sweep.svg
+
 # Misc
 *.log
 .DS_Store
