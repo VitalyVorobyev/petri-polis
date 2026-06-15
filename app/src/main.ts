@@ -20,8 +20,10 @@ import {
   createBloomFBO,
   createFieldTexture,
   createGL,
+  createLabelTexture,
   createObstacleTexture,
   uploadField,
+  uploadLabels,
   uploadObstacle,
 } from "./render/gl";
 import {
@@ -210,6 +212,70 @@ void main() {
 }`;
 
 // ---------------------------------------------------------------------------
+// Component map — color each connected component a distinct hue.
+// The label texture is R32UI (one u32 per cell, 0 = background). A cheap integer
+// hash of the id → hue makes adjacent components contrast strongly. Background
+// (id 0) → near-black; walls → a dim slate matching the tone-map's wall colour.
+// Sampled with NEAREST so component boundaries stay crisp (no interpolation).
+// ---------------------------------------------------------------------------
+const FRAG_COMPONENTS = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+in vec2 v_uv;
+uniform usampler2D u_labels;  // R32UI: 0 = background, else component id
+uniform sampler2D u_obstacle; // wall mask (R8)
+out vec4 o;
+
+vec3 hsv2rgb(vec3 c) {
+  vec3 p = abs(fract(c.xxx + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+  return c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
+}
+
+void main() {
+  if (texture(u_obstacle, v_uv).r > 0.0) {
+    o = vec4(vec3(0.07, 0.09, 0.12), 1.0); // wall slate (matches tone-map)
+    return;
+  }
+  uint id = texture(u_labels, v_uv).r;
+  if (id == 0u) {
+    o = vec4(0.02, 0.025, 0.04, 1.0); // background near-black
+    return;
+  }
+  // Integer hash → hue. Mixing the id through a couple of multiplies spreads
+  // consecutive ids across the wheel so neighbours rarely share a hue.
+  uint h = id * 2654435761u;
+  float hue = float(h & 0xffffu) / 65535.0;
+  float sat = 0.65 + float((h >> 16) & 0xffu) / 255.0 * 0.30;
+  o = vec4(hsv2rgb(vec3(hue, sat, 1.0)), 1.0);
+}`;
+
+// ---------------------------------------------------------------------------
+// Long-exposure accumulate — fold the current tone-mapped frame into a
+// persistent RGBA16F buffer: accum = max(accum * fade, current). The slow fade
+// keeps a fading memory of where the network has been, so its full history is
+// visible as a time-integrated glow. Output goes to the accumulator FBO; the
+// shader reads the previous accumulator and the current base in one pass.
+// ---------------------------------------------------------------------------
+const FRAG_ACCUM = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_prev;     // previous accumulator (the running integral)
+uniform sampler2D u_base;     // this frame's tone-mapped base
+uniform sampler2D u_bloom;    // this frame's blurred bloom
+uniform float u_strength;     // bloom blend weight (matches the Normal composite)
+uniform float u_fade;         // per-frame decay of the memory (e.g. 0.985)
+out vec4 o;
+
+void main() {
+  // This frame's image = the exact Normal composite (base + additive bloom).
+  vec3 cur = texture(u_base, v_uv).rgb + texture(u_bloom, v_uv).rgb * u_strength;
+  // Fold it into the faded running integral, keeping the brightest history.
+  vec3 prev = texture(u_prev, v_uv).rgb * u_fade;
+  o = vec4(max(prev, cur), 1.0);
+}`;
+
+// ---------------------------------------------------------------------------
 // Endpoint markers — one glowing ring per endpoint, drawn additively over the
 // final composite so they mark sources/sinks at a glance. Each endpoint is one
 // gl.POINTS vertex; the vertex shader looks up its centre/size from a uniform
@@ -258,6 +324,19 @@ const BLOOM_STRENGTH = 1.8; // additive blend weight
 const BLUR_PASSES = 3; // number of blur iteration pairs
 
 // ---------------------------------------------------------------------------
+// Render modes + long-exposure
+// ---------------------------------------------------------------------------
+type RenderMode = "normal" | "components" | "long-exposure";
+
+const LONG_EXPOSURE_FADE = 0.985; // per-frame decay of the accumulator memory
+
+// Structure metrics are O(N) reductions (union-find, box-counting,
+// autocorrelation) — far heavier than the per-frame sum reductions. Sample them
+// on a throttled cadence and reuse the last value between samples so fps stays
+// smooth.
+const STRUCTURE_SAMPLE_INTERVAL = 20; // frames between structure-metric samples
+
+// ---------------------------------------------------------------------------
 // EMA auto-exposure
 // ---------------------------------------------------------------------------
 const EMA_ALPHA = 0.05; // lerp speed — slow enough to avoid flicker
@@ -284,19 +363,36 @@ function makeObstacleView(wasm: { memory: WebAssembly.Memory }, sim: Sim): Uint8
   return new Uint8Array(wasm.memory.buffer, sim.obstacle_ptr(), sim.obstacle_len());
 }
 
+// The component-label buffer is a u32-per-cell view (0 = background, else a
+// 1..=component_count id). It is filled as a side effect of component_count() /
+// loop_count() — all-zero before any such call — but its pointer is valid from
+// construction, so the view can be built eagerly here like the others.
+function makeLabelsView(wasm: { memory: WebAssembly.Memory }, sim: Sim): Uint32Array {
+  return new Uint32Array(
+    wasm.memory.buffer,
+    sim.component_labels_ptr(),
+    sim.component_labels_len(),
+  );
+}
+
 // Re-fetch all zero-copy views and return them. Call after every reset-class
 // op (reset / spawn / load_maze_demo / add_endpoint / clear_endpoints): WASM
 // memory may grow and detach every view, so all of them must be rebuilt.
 function refreshViews(
   wasm: { memory: WebAssembly.Memory },
   sim: Sim,
-): { trails: Float32Array[]; food: Float32Array; obstacle: Uint8Array } {
+): { trails: Float32Array[]; food: Float32Array; obstacle: Uint8Array; labels: Uint32Array } {
   const count = sim.species_count();
   const trails: Float32Array[] = [];
   for (let s = 0; s < count; s++) {
     trails.push(makeTrailView(wasm, sim, s));
   }
-  return { trails, food: makeFoodView(wasm, sim), obstacle: makeObstacleView(wasm, sim) };
+  return {
+    trails,
+    food: makeFoodView(wasm, sim),
+    obstacle: makeObstacleView(wasm, sim),
+    labels: makeLabelsView(wasm, sim),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +528,16 @@ interface PresetsState {
 }
 
 // ---------------------------------------------------------------------------
+// Render state — the active render mode (drives the Render mode dropdown).
+//   normal        — bioluminescent tone-map + bloom (default, unchanged).
+//   components    — connected-component map (each component a distinct hue).
+//   long-exposure — time-integrated trail accumulated across frames.
+// ---------------------------------------------------------------------------
+interface RenderState {
+  mode: RenderMode;
+}
+
+// ---------------------------------------------------------------------------
 // Programmatic-refresh guard. When we sync the panel from the sim (after a
 // preset or shared-link load) we call `pane.refresh()`, which fires the
 // bindings' `change` events. Those handlers would otherwise write the widgets'
@@ -553,10 +659,12 @@ function buildPane(
   geometry: GeometryState,
   transport: Transport,
   presets: PresetsState,
+  render: RenderState,
   onReset: () => void,
   onLoadMaze: () => void,
   onClearGeometry: () => void,
   onApplyPreset: (id: string) => void,
+  onRenderModeChange: () => void,
   seedRef: { value: number },
   metricsBuf: MetricsBuffer,
   paneRef: { pane: Pane | null },
@@ -587,6 +695,23 @@ function buildPane(
       { text: "10×", value: 10 },
     ],
   });
+
+  // --- Render mode ---------------------------------------------------------
+  // How the field is presented: the default bioluminescent tone-map, a
+  // connected-component map (each component a distinct hue — makes the
+  // components metric visible), or a long-exposure time-integration of the
+  // network. Normal is byte-for-byte the default renderer.
+  pane
+    .addBinding(render, "mode", {
+      label: "render mode",
+      view: "list",
+      options: [
+        { text: "Normal", value: "normal" },
+        { text: "Component map", value: "components" },
+        { text: "Long-exposure", value: "long-exposure" },
+      ],
+    })
+    .on("change", () => onRenderModeChange());
 
   // --- Presets (the lab bench) ---------------------------------------------
   // A menu of named classical complex-systems scenarios. Selecting one applies
@@ -833,6 +958,10 @@ interface FBOSet {
   base: BloomFBO;
   ping: BloomFBO;
   pong: BloomFBO;
+  // Long-exposure accumulator (full resolution, RGBA16F). Ping-ponged because
+  // the accumulate pass reads the previous accumulator while writing the next.
+  accumA: BloomFBO;
+  accumB: BloomFBO;
 }
 
 function allocFBOs(gl: WebGL2RenderingContext, w: number, h: number): FBOSet {
@@ -842,6 +971,8 @@ function allocFBOs(gl: WebGL2RenderingContext, w: number, h: number): FBOSet {
     base: createBloomFBO(gl, w, h),
     ping: createBloomFBO(gl, bw, bh),
     pong: createBloomFBO(gl, bw, bh),
+    accumA: createBloomFBO(gl, w, h),
+    accumB: createBloomFBO(gl, w, h),
   };
 }
 
@@ -880,6 +1011,8 @@ async function main(): Promise<void> {
   const progBlur = compileProgram(gl, VERT, FRAG_BLUR);
   const progComposite = compileProgram(gl, VERT, FRAG_COMPOSITE);
   const progMarker = compileProgram(gl, VERT_MARKER, FRAG_MARKER);
+  const progComponents = compileProgram(gl, VERT, FRAG_COMPONENTS);
+  const progAccum = compileProgram(gl, VERT, FRAG_ACCUM);
 
   // ---------------------------------------------------------------------------
   // Trail textures — one per species (R32F, updated each frame)
@@ -901,6 +1034,24 @@ async function main(): Promise<void> {
   const obstacleTex = createObstacleTexture(gl, WIDTH, HEIGHT);
 
   // ---------------------------------------------------------------------------
+  // Component-label texture (R32UI) — uploaded only while the component-map
+  // render mode is active, from the labels buffer the sim fills as a side
+  // effect of component_count().
+  // ---------------------------------------------------------------------------
+  const labelTex = createLabelTexture(gl, WIDTH, HEIGHT);
+
+  // ---------------------------------------------------------------------------
+  // Render mode + long-exposure accumulator bookkeeping. `accumActive` tracks
+  // which of the two accumulator FBOs holds the latest integral (they ping-pong
+  // each frame). `accumCleared` forces the accumulator to be wiped on the next
+  // long-exposure frame after a reset / preset / seed change / resize, so the
+  // network history doesn't bleed across worlds.
+  // ---------------------------------------------------------------------------
+  const render: RenderState = { mode: "normal" };
+  let accumActive = 0; // 0 → accumA holds the latest, 1 → accumB
+  let accumCleared = false; // whether the active accumulator currently holds a valid integral
+
+  // ---------------------------------------------------------------------------
   // Off-screen FBOs — reallocated on resize
   // ---------------------------------------------------------------------------
   let fbos: FBOSet = allocFBOs(gl, 1, 1);
@@ -911,6 +1062,7 @@ async function main(): Promise<void> {
     canvas.height = Math.floor(window.innerHeight * dpr);
     gl.viewport(0, 0, canvas.width, canvas.height);
     fbos = allocFBOs(gl, canvas.width, canvas.height);
+    accumCleared = false; // freshly-allocated accumulator FBOs need a clear
   }
   window.addEventListener("resize", resize);
   resize();
@@ -937,6 +1089,15 @@ async function main(): Promise<void> {
   const ulMarker_centers = gl.getUniformLocation(progMarker, "u_centers");
   const ulMarker_sizes = gl.getUniformLocation(progMarker, "u_sizes");
   const ulMarker_color = gl.getUniformLocation(progMarker, "u_color");
+  // component map
+  const ulComp_labels = gl.getUniformLocation(progComponents, "u_labels");
+  const ulComp_obstacle = gl.getUniformLocation(progComponents, "u_obstacle");
+  // long-exposure accumulate
+  const ulAccum_prev = gl.getUniformLocation(progAccum, "u_prev");
+  const ulAccum_base = gl.getUniformLocation(progAccum, "u_base");
+  const ulAccum_bloom = gl.getUniformLocation(progAccum, "u_bloom");
+  const ulAccum_strength = gl.getUniformLocation(progAccum, "u_strength");
+  const ulAccum_fade = gl.getUniformLocation(progAccum, "u_fade");
 
   // ---------------------------------------------------------------------------
   // Per-species EMA references for auto-exposure + shared food normalization.
@@ -975,6 +1136,10 @@ async function main(): Promise<void> {
   const captionRef = { value: presetById(DEFAULT_PRESET_ID)?.caption ?? "" };
   const geometryTagRef: { value: GeometryTag } = { value: "none" };
 
+  function clearAccumulator(): void {
+    accumCleared = false; // request a GPU clear on the next long-exposure frame
+  }
+
   // ---------------------------------------------------------------------------
   // Metrics ring buffer + food ceiling (captured on reset)
   // ---------------------------------------------------------------------------
@@ -983,7 +1148,36 @@ async function main(): Promise<void> {
 
   let latestSample: MetricSample | null = null;
 
+  // Cached structure metrics — the four O(N) reductions are refreshed only on a
+  // throttled cadence (see STRUCTURE_SAMPLE_INTERVAL) and reused in between so
+  // fps stays smooth. `structureFrame` counts frames toward the next refresh.
+  const structure = {
+    componentCount: 0,
+    loopCount: 0,
+    fractalDimension: 0,
+    autocorrLength: 0,
+  };
+  let structureFrame = STRUCTURE_SAMPLE_INTERVAL; // force a sample on the first frame
+
+  // Refresh the cached structure metrics from the sim (heavy O(N) reductions).
+  // component_count() / loop_count() also fill the component-labels buffer as a
+  // side effect.
+  function refreshStructureMetrics(): void {
+    structure.componentCount = sim.component_count();
+    structure.loopCount = sim.loop_count();
+    structure.fractalDimension = sim.fractal_dimension();
+    structure.autocorrLength = sim.autocorrelation_length();
+  }
+
   function recordSample(): void {
+    // Refresh the heavy structure metrics only on the throttled cadence; reuse
+    // the cached values for every frame in between.
+    if (structureFrame >= STRUCTURE_SAMPLE_INTERVAL) {
+      refreshStructureMetrics();
+      structureFrame = 0;
+    }
+    structureFrame++;
+
     const s: MetricSample = {
       tick: sim.tick_count(),
       pop: [sim.species_population(0), sim.species_population(1)],
@@ -993,6 +1187,10 @@ async function main(): Promise<void> {
       connected: sim.endpoints_connected(),
       endpointCount: sim.endpoint_count(),
       networkCost: sim.network_cost(),
+      componentCount: structure.componentCount,
+      loopCount: structure.loopCount,
+      fractalDimension: structure.fractalDimension,
+      autocorrLength: structure.autocorrLength,
     };
     metricsBuf.push(s);
     latestSample = s;
@@ -1014,6 +1212,8 @@ async function main(): Promise<void> {
     metricsBuf.clear();
     metricsBuf.foodCeiling = sim.food_total();
     latestSample = null;
+    structureFrame = STRUCTURE_SAMPLE_INTERVAL; // re-sample structure next frame
+    clearAccumulator();
   }
 
   // Sync the mutable param objects + Tweakpane from the sim's current state.
@@ -1047,6 +1247,8 @@ async function main(): Promise<void> {
     metricsBuf.clear();
     metricsBuf.foodCeiling = sim.food_total();
     latestSample = null;
+    structureFrame = STRUCTURE_SAMPLE_INTERVAL;
+    clearAccumulator();
     syncPanelFromSim();
   }
 
@@ -1145,6 +1347,8 @@ async function main(): Promise<void> {
     metricsBuf.clear();
     metricsBuf.foodCeiling = sim.food_total();
     latestSample = null;
+    structureFrame = STRUCTURE_SAMPLE_INTERVAL;
+    clearAccumulator();
     syncPanelFromSim();
   }
 
@@ -1177,10 +1381,16 @@ async function main(): Promise<void> {
     geometry,
     transport,
     presets,
+    render,
     doReset,
     doLoadMaze,
     doClearGeometry,
     doApplyPreset,
+    // Entering long-exposure (or switching modes back into it) starts a fresh
+    // integral, so the previous mode's accumulator never bleeds through.
+    () => {
+      if (render.mode === "long-exposure") clearAccumulator();
+    },
     seedRef,
     metricsBuf,
     paneRef,
@@ -1295,73 +1505,144 @@ async function main(): Promise<void> {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     // ------------------------------------------------------------------
-    // Pass 2 — Bright-pass → ping FBO (half resolution)
+    // Mode dispatch. `drawMarkers` flags whether the endpoint rings go on top
+    // (Normal + Long-exposure show them; the Component map is a pure
+    // measurement view so it omits them).
     // ------------------------------------------------------------------
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.ping.fbo);
-    gl.viewport(0, 0, fbos.ping.width, fbos.ping.height);
-    gl.useProgram(progBright);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, fbos.base.tex);
-    gl.uniform1i(ulBright_src, 0);
-    gl.uniform1f(ulBright_thresh, BLOOM_THRESHOLD);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    let drawMarkers = true;
 
-    // ------------------------------------------------------------------
-    // Pass 3 — Separable Gaussian blur (BLUR_PASSES × horizontal+vertical)
-    // ping → pong → ping → ...  final result in srcFBO
-    // ------------------------------------------------------------------
-    const invW = 1.0 / fbos.ping.width;
-    const invH = 1.0 / fbos.ping.height;
-    let srcFBO = fbos.ping;
-    let dstFBO = fbos.pong;
+    if (render.mode === "components") {
+      // --- Component map ---------------------------------------------------
+      // The labels buffer is filled as a side effect of component_count(); call
+      // it EVERY frame while this mode is active so the overlay is fresh, then
+      // upload the labels and colour each component by a hash of its id.
+      sim.component_count();
+      uploadLabels(gl, labelTex, WIDTH, HEIGHT, views.labels);
 
-    for (let i = 0; i < BLUR_PASSES; i++) {
-      // Horizontal
-      gl.bindFramebuffer(gl.FRAMEBUFFER, dstFBO.fbo);
-      gl.viewport(0, 0, dstFBO.width, dstFBO.height);
-      gl.useProgram(progBlur);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.useProgram(progComponents);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, srcFBO.tex);
-      gl.uniform1i(ulBlur_src, 0);
-      gl.uniform2f(ulBlur_dir, invW, 0.0);
+      gl.bindTexture(gl.TEXTURE_2D, labelTex);
+      gl.uniform1i(ulComp_labels, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, obstacleTex);
+      gl.uniform1i(ulComp_obstacle, 1);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
-      [srcFBO, dstFBO] = [dstFBO, srcFBO];
-
-      // Vertical
-      gl.bindFramebuffer(gl.FRAMEBUFFER, dstFBO.fbo);
-      gl.viewport(0, 0, dstFBO.width, dstFBO.height);
-      gl.useProgram(progBlur);
+      drawMarkers = false;
+    } else {
+      // --- Bloom (Normal + Long-exposure share the bright-pass + blur) -----
+      // Pass 2 — Bright-pass → ping FBO (half resolution)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbos.ping.fbo);
+      gl.viewport(0, 0, fbos.ping.width, fbos.ping.height);
+      gl.useProgram(progBright);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, srcFBO.tex);
-      gl.uniform1i(ulBlur_src, 0);
-      gl.uniform2f(ulBlur_dir, 0.0, invH);
+      gl.bindTexture(gl.TEXTURE_2D, fbos.base.tex);
+      gl.uniform1i(ulBright_src, 0);
+      gl.uniform1f(ulBright_thresh, BLOOM_THRESHOLD);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
-      [srcFBO, dstFBO] = [dstFBO, srcFBO];
+
+      // Pass 3 — Separable Gaussian blur (BLUR_PASSES × horizontal+vertical)
+      const invW = 1.0 / fbos.ping.width;
+      const invH = 1.0 / fbos.ping.height;
+      let srcFBO = fbos.ping;
+      let dstFBO = fbos.pong;
+
+      for (let i = 0; i < BLUR_PASSES; i++) {
+        // Horizontal
+        gl.bindFramebuffer(gl.FRAMEBUFFER, dstFBO.fbo);
+        gl.viewport(0, 0, dstFBO.width, dstFBO.height);
+        gl.useProgram(progBlur);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, srcFBO.tex);
+        gl.uniform1i(ulBlur_src, 0);
+        gl.uniform2f(ulBlur_dir, invW, 0.0);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        [srcFBO, dstFBO] = [dstFBO, srcFBO];
+
+        // Vertical
+        gl.bindFramebuffer(gl.FRAMEBUFFER, dstFBO.fbo);
+        gl.viewport(0, 0, dstFBO.width, dstFBO.height);
+        gl.useProgram(progBlur);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, srcFBO.tex);
+        gl.uniform1i(ulBlur_src, 0);
+        gl.uniform2f(ulBlur_dir, 0.0, invH);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        [srcFBO, dstFBO] = [dstFBO, srcFBO];
+      }
+      // srcFBO now holds the blurred bloom image.
+      const bloomTex = srcFBO.tex;
+
+      if (render.mode === "long-exposure") {
+        // --- Long-exposure -------------------------------------------------
+        // Fold this frame's Normal composite (base + bloom, computed inside the
+        // accum shader) into a persistent accumulator with a slow fade, so the
+        // network's whole history glows. The two accumulator FBOs alternate
+        // roles each frame: `prev` = last frame's integral (read), `next` = the
+        // new integral (written). Nothing is read and written at once.
+        const prev = accumActive === 0 ? fbos.accumA : fbos.accumB;
+        const next = accumActive === 0 ? fbos.accumB : fbos.accumA;
+
+        // fade = 0 wipes the (just-allocated or invalidated) accumulator on its
+        // first frame so no stale history bleeds across worlds; thereafter the
+        // slow fade keeps a fading memory.
+        const fade = accumCleared ? LONG_EXPOSURE_FADE : 0.0;
+        accumCleared = true;
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, next.fbo);
+        gl.viewport(0, 0, next.width, next.height);
+        gl.useProgram(progAccum);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, prev.tex);
+        gl.uniform1i(ulAccum_prev, 0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, fbos.base.tex);
+        gl.uniform1i(ulAccum_base, 1);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, bloomTex);
+        gl.uniform1i(ulAccum_bloom, 2);
+        gl.uniform1f(ulAccum_strength, BLOOM_STRENGTH);
+        gl.uniform1f(ulAccum_fade, fade);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        // `next` now holds the latest integral; make it the active accumulator.
+        accumActive = next === fbos.accumA ? 0 : 1;
+
+        // Present the accumulator to the screen (straight copy via the
+        // composite program with bloom strength 0).
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.useProgram(progComposite);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, next.tex);
+        gl.uniform1i(ulComp_base, 0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, next.tex);
+        gl.uniform1i(ulComp_bloom, 1);
+        gl.uniform1f(ulComp_strength, 0.0); // present the integral as-is
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      } else {
+        // --- Normal — Pass 4: composite base + additive bloom → canvas ------
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.useProgram(progComposite);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, fbos.base.tex);
+        gl.uniform1i(ulComp_base, 0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, bloomTex);
+        gl.uniform1i(ulComp_bloom, 1);
+        gl.uniform1f(ulComp_strength, BLOOM_STRENGTH);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      }
     }
-    // srcFBO now holds the blurred bloom image.
-    const bloomTex = srcFBO.tex;
-
-    // ------------------------------------------------------------------
-    // Pass 4 — Composite: base + additive bloom → canvas
-    // ------------------------------------------------------------------
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.useProgram(progComposite);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, fbos.base.tex);
-    gl.uniform1i(ulComp_base, 0);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, bloomTex);
-    gl.uniform1i(ulComp_bloom, 1);
-    gl.uniform1f(ulComp_strength, BLOOM_STRENGTH);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     // ------------------------------------------------------------------
     // Pass 5 — Endpoint markers: additive glowing rings over the composite.
     // sim coords → clip space matches the spawn handler's Y convention
     // (field row 0 is at the bottom, so sim y maps straight to clip y).
     // ------------------------------------------------------------------
-    const epCount = Math.min(sim.endpoint_count(), MAX_MARKERS);
+    const epCount = drawMarkers ? Math.min(sim.endpoint_count(), MAX_MARKERS) : 0;
     if (epCount > 0) {
       const centers = new Float32Array(MAX_MARKERS * 2);
       const sizes = new Float32Array(MAX_MARKERS);

@@ -11,6 +11,7 @@
 - [Cross-species sensing](./cross-species.md)
 - [Sources, sinks & mazes](./geography.md)
 - [The preset gallery](./presets.md)
+- [Structure metrics](./structure-metrics.md)
 - [Parameter reference](./parameters.md)
 - [The rendering pipeline](./rendering.md)
 - [WASM and the zero-copy field](./wasm.md)

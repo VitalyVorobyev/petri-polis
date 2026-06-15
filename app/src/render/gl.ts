@@ -106,6 +106,38 @@ export function uploadObstacle(
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
 }
 
+/**
+ * Immutable-storage single-channel **unsigned-integer** texture for the
+ * connected-component label buffer (one `u32` per cell). Sampled with a
+ * `usampler2D` in the component-map shader. Integer textures cannot be filtered,
+ * so it is always NEAREST. Update with {@link uploadLabels}.
+ */
+export function createLabelTexture(
+  gl: WebGL2RenderingContext,
+  width: number,
+  height: number,
+): WebGLTexture {
+  const tex = gl.createTexture()!;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R32UI, width, height);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+
+export function uploadLabels(
+  gl: WebGL2RenderingContext,
+  tex: WebGLTexture,
+  width: number,
+  height: number,
+  data: Uint32Array,
+): void {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RED_INTEGER, gl.UNSIGNED_INT, data);
+}
+
 /** A framebuffer + RGBA16F texture pair used as a bloom ping-pong target. */
 export interface BloomFBO {
   fbo: WebGLFramebuffer;
