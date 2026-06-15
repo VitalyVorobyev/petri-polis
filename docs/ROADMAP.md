@@ -3,10 +3,18 @@
 Each milestone must produce something **visually rewarding** — that's the design constraint
 that keeps a side project alive. A milestone is done only when its **gate** is met.
 
-**Status: M0–M5 are shipped.** The toy has the Physarum core, live controls, the boom/bust
-ecology, two coexisting species, and the inspect/measure/share instrument — and it publishes to
-GitHub Pages (live demo + guide + API docs). **M6 (scale) is the only open milestone**, and is
-optional — pursued only if scale is craved.
+**Status: M0–M5 (the toy) and M6 (world geography) are shipped.** The toy has the Physarum core,
+live controls, the boom/bust ecology, two coexisting species, and the inspect/measure/share
+instrument; M6 added obstacles, endpoint food sources, chemotaxis, and the reachability metric —
+the Physarum-solves-the-maze demo. It all publishes to GitHub Pages (live demo + guide + API
+docs). **M7–M11 are the remaining lab phase**, sequenced in payoff order.
+
+**From toy to lab.** The toy proves emergence is fun and reproducible; the lab proves the toy
+*computes* — it reproduces classical complex-systems demos as one-click presets — and lets you
+*measure* what it produces, via structure metrics and headless parameter sweeps that yield
+phase diagrams. One experiment threads through every lab milestone: **sweep one knob slowly and
+watch a regime shift.** Drag `decay` from 0.7 → 0.99 and speckle snaps into a connected network
+at a threshold. That phase transition is the thing the lab makes visible and quantifiable.
 
 ## Phase 0 — Scaffolding (docs + agents)
 Cross-session machinery, lean and living: the 4 docs (CLAUDE.md, DESIGN.md, ROADMAP.md,
@@ -56,7 +64,51 @@ reactive layer for the panels only; the render loop stays vanilla regardless (se
 **Gate:** a shared URL reproduces the same run on another load, and a run's metric series can
 be exported and re-plotted.
 
-## M6 — Scale (optional)
-`wasm-simd` + wasm threads (rayon) for the field/agent passes, or migrate the hot loop to
-**WebGPU compute** for Sage-Jenson-scale millions.
-**Gate:** target agent count rises ~10×+ while holding ~60 fps. Only pursued if scale is craved.
+## M6 — World geography: sources, sinks & obstacles ✅ done
+The world gets a geography. An obstacle mask the trail can't enter, designated endpoint food
+sources, food-attraction chemotaxis that steers agents toward those endpoints, and a
+reachability / network-cost metric — the renderer marks endpoints, draws walls, and lets you
+paint both.
+**Gate:** the network routes around a wall and connects two endpoints; the reachability readout
+flips to "connected." **This is the change that turns "pretty" into "it computes."**
+
+## M7 — Presets: the lab bench
+Named, shareable scenarios bundling params + ecology + geometry + spawn, with a menu and a
+starter gallery of classical demos (maze, Tokyo rail, capillary mesh, trunk roads, spiral
+cells, boom/bust oscillator, competitive exclusion, coexistence). Built on the existing URL
+codec, extended to carry geometry.
+**Gate:** pick a preset and the canonical structure appears in seconds; every preset round-trips
+as a shareable link.
+
+## M8 — Cross-species sensing: ecological coupling
+Each species senses the other's trail with a signed attract/avoid weight (a 2×2 sensing
+matrix) — territories, predator/prey, chasing fronts, from a handful of lines in the agent loop.
+**Gate:** two species form a territory boundary or a chase that neither produces alone, and it
+stays deterministic.
+
+## M9 — Structure metrics: the render becomes a measurement
+Cheap, read-only observables that quantify emergence — connected components & loops (union-find
+/ Euler characteristic), trail length & branching (skeleton), fractal dimension (box-counting),
+spatial autocorrelation length, plus a Lyapunov-style seed-perturbation divergence — exposed as
+new metric series and render overlays (component map, skeleton, long-exposure).
+**Gate:** a slow `decay` sweep shows the component count collapse at a threshold — a measured
+phase transition, on screen and in the exported CSV.
+
+## M10 — Headless parameter sweep: phase diagrams
+A native `petri-core` batch runner (no browser): vary one or two knobs across N values × M
+seeds, record an order parameter (component count, coexistence, oscillation period), and emit a
+CSV/figure.
+**Gate:** a reproducible phase-diagram CSV — and a plotted figure — locating a regime boundary
+(a bifurcation).
+
+## M11 — Evolution: heritable traits
+On reproduction, copy the parent's params with a small mutation instead of the species default,
+so strategies evolve under selection by the food and geometry landscape — no RL or learned
+behavior. Trait-distribution metric + trait/age coloring.
+**Gate:** under a fixed landscape a trait distribution measurably drifts over a run, and reset +
+same seed reproduces the evolutionary trajectory.
+
+---
+*Scale, if a sweep or a live run ever needs it (`wasm-simd`, wasm threads, or a WebGPU compute
+hot loop), is pulled in by the milestone that demands it — M10 most likely — not pursued as a
+goal of its own.*

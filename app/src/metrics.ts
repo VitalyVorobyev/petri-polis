@@ -9,6 +9,9 @@ export interface MetricSample {
   mass: [number, number]; // trail mass (unbounded f64)
   foodTotal: number; // total food remaining (f64, bounded by ceiling)
   foodCoverage: number; // fraction of cells with food, [0, 1]
+  connected: number; // endpoints reachable from endpoint 0 (incl. itself)
+  endpointCount: number; // total endpoints
+  networkCost: number; // cells in the reachable network (unbounded)
 }
 
 const RING_CAP = 600;
@@ -20,6 +23,9 @@ export class MetricsBuffer {
 
   // Running maxima for unbounded series (trail mass).
   maxMass: [number, number] = [1, 1];
+
+  // Running maximum for the unbounded network-cost series.
+  maxNetworkCost = 1;
 
   // Food ceiling: total food right after new/reset (food starts full).
   foodCeiling = 1;
@@ -34,6 +40,7 @@ export class MetricsBuffer {
     }
     if (s.mass[0] > this.maxMass[0]) this.maxMass[0] = s.mass[0];
     if (s.mass[1] > this.maxMass[1]) this.maxMass[1] = s.mass[1];
+    if (s.networkCost > this.maxNetworkCost) this.maxNetworkCost = s.networkCost;
   }
 
   // Chronological ordered snapshot (oldest → newest).
@@ -47,6 +54,7 @@ export class MetricsBuffer {
     this.head = 0;
     this.count = 0;
     this.maxMass = [1, 1];
+    this.maxNetworkCost = 1;
     // foodCeiling is reset by the caller after querying the new value.
   }
 
@@ -181,6 +189,28 @@ export function drawSparklines(
       CELL_H - LABEL_H,
       (s) => s.foodCoverage,
       "#5ca832",
+      1.2,
+    );
+  }
+
+  // --- Row 4: Reachability (connected endpoints + network cost) ---
+  {
+    const top = rowY(4);
+    const label =
+      latest.endpointCount > 0
+        ? `connected ${latest.connected}/${latest.endpointCount}  cost ${fmtSI(latest.networkCost)}`
+        : "connected —  (no endpoints)";
+    drawLabel(ctx, PAD_L, top, label);
+    const maxCost = Math.max(1, buf.maxNetworkCost);
+    drawLine(
+      ctx,
+      samples,
+      PAD_L,
+      top + LABEL_H,
+      plotW,
+      CELL_H - LABEL_H,
+      (s) => s.networkCost / maxCost,
+      "#f0b429",
       1.2,
     );
   }

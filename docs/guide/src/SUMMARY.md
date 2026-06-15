@@ -8,6 +8,7 @@
 - [Determinism](./determinism.md)
 - [Ecology and population dynamics](./ecology.md)
 - [Two species](./two-species.md)
+- [Sources, sinks & mazes](./geography.md)
 - [Parameter reference](./parameters.md)
 - [The rendering pipeline](./rendering.md)
 - [WASM and the zero-copy field](./wasm.md)

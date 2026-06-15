@@ -28,6 +28,15 @@ run through a **bioluminescent palette**:
   regrowth re-greens it, so the boom/bust cycle is legible — kept below the bloom threshold so only the
   trails glow.
 
+## Geography: walls and endpoints
+
+When the world has geography (see [Sources, sinks & mazes](./geography.md)), two more things reach
+the picture. The **obstacle mask** uploads as an `R8` texture; wall cells render as a dim slate
+underlay, kept below the bloom threshold so they read as solid barriers rather than glowing. Each
+**endpoint** is drawn as a soft additive amber ring at its position, so the sources and sinks the
+colony is meant to connect are visible at a glance. Both live in the same pipeline — the walls
+under the trails, the rings over the bloom — so the structure stays legible without a separate mode.
+
 ## Bloom
 
 To make the bright trails read as light rather than flat colour, a **bloom** pass runs:

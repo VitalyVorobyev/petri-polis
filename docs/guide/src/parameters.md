@@ -8,7 +8,8 @@ them, with the default for each species and what each does to the emergent pictu
 ## Physarum parameters (`Params`)
 
 Set together via `set_params(species, sensor_angle, sensor_distance, rotation_angle, step_size,
-deposit, decay)`, plus `set_diffuse_weight(species, weight)`.
+deposit, decay)`, plus `set_diffuse_weight(species, weight)` and `set_food_attraction(species,
+weight)`.
 
 | Parameter | Units | Species 0 | Species 1 | Effect |
 |---|---|---|---|---|
@@ -19,6 +20,7 @@ deposit, decay)`, plus `set_diffuse_weight(species, weight)`.
 | `deposit_amount` | field units | 4.0 | 7.0 | Trail laid per tick. Higher → brighter, more persistent, thicker trails that recruit more agents. |
 | `decay` | multiplier (0,1) | 0.88 | 0.92 | Per-tick evaporation (`field *= decay`). Closer to 1 → long-lived, slowly-fading structure; smaller → fast, twitchy turnover. |
 | `diffuse_weight` | weight [0,1] | 0.5 | 0.55 | Centre-tap weight of the separable blur. 1.0 → no diffusion (speckle); lower → softer, more spread glow. |
+| `food_attraction` | weight | 0.0 | 0.0 | Chemotaxis: how strongly food under a sensor adds to the trail it reads. `0` → ignore food and follow trail only (the default); higher → agents climb the food gradient toward endpoints. The maze demo uses `6.0` (see [Sources, sinks & mazes](./geography.md)). |
 
 The species-0 set weaves a dense capillary mesh; the species-1 set lays a few broad trunk routes. The
 contrast between them is the whole point — two visually distinct systems sharing a frame (see
@@ -54,6 +56,15 @@ death_return)`.
 By default the two species share `metabolism`, `eat_rate`, `food_regrow`, and `death_return`, and
 differ mainly in `repro_threshold`, which staggers their cycles. Together these set the **period and
 amplitude** of the boom/bust oscillation (see [Ecology and population dynamics](./ecology.md)).
+
+## Geometry & the reachability threshold
+
+Two more live knobs come with [world geography](./geography.md). `food_attraction` (above) is the
+chemotaxis drive that pulls agents toward food wells. `network_threshold` — set via
+`set_network_threshold` (default `0.05`, a fraction of the current trail peak) — sets how bright a
+trail must be to count as part of the network when the reachability metric decides whether the
+endpoints are connected. Lower it to count faint exploratory trails, raise it to count only the
+consolidated routes.
 
 ## Structural constants (rebuild required)
 

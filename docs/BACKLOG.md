@@ -78,5 +78,51 @@ The next-task queue. Open this first each session, do the top unchecked item, ti
 - [x] `ci.yml` builds the book so a broken guide fails PR CI
 - [x] README/ROADMAP/DESIGN/CLAUDE synced to the shipped M2–M5 features
 
-## Later (see ROADMAP.md)
-M6 scale (optional — only if scale is craved).
+## M6 — World geography: sources, sinks & obstacles ✅ gate met — the maze network routes around the walls and bridges both endpoints; reachability flips to 2/2
+- [x] petri-core: obstacle mask (`Vec<u8>`, allocated in `new`, never grows) — sensors read walls as 0; a move into a wall is blocked + reorients via one RNG draw *only when blocked*; trail held at 0 under walls in the field pass
+- [x] petri-core: `food_attraction` `Params` knob (default `0.0`) — sense step adds `food_attraction * food_sample` per sensor, guarded so the zero default is byte-identical
+- [x] petri-core: endpoint food sources (`add_endpoint`/`clear_endpoints`) pinning `food_cap` high within a radius, reusing the Gaussian food-cap machinery
+- [x] petri-core: reachability / network-cost metric — threshold the combined trail field, flood-fill from endpoint 0 over open cells (pre-allocated scratch, on-demand, read-only); report `endpoints_connected` + `network_cost`
+- [x] petri-core: `load_maze_demo` — clears default food, lays a three-wall serpentine maze + a sealed toroidal-seam wall (so the only route threads the gaps), places two endpoints, sets `food_attraction`, and blanket-seeds the colony across all open cells (pre-grown-mold coverage)
+- [x] petri-core: walls fully masked from chemotaxis (wall cells read 0 trail AND 0 food in the sensor); painting a wall zeroes the trail under it immediately (no one-tick diffusion leak)
+- [x] petri-core: tests — empty-geometry golden checksum UNCHANGED (byte-identical); re-pinned maze golden; reachability disconnected→connected + obstacle-split-stays-disconnected; `maze_seam_blocks_a_straight_bridge`; `maze_demo_connects_the_endpoints`; `maze_agents_never_enter_walls`; `food_attraction_zero_is_inert` (24/24 pass)
+- [x] petri-wasm: `obstacle_ptr`/`obstacle_len` (stable), `paint_obstacle`/`clear_obstacles`, `add_endpoint`/`clear_endpoints` + endpoint accessors, `load_maze_demo`, `set_food_attraction`/getter, `set_network_threshold`/getter, `endpoints_connected`/`network_cost`
+- [x] app: upload the obstacle mask as an `R8` texture; render walls as a dim slate underlay in the tone-map pass, suppressing trail/food/bloom there
+- [x] app: endpoint markers (additive amber rings) at endpoint positions
+- [x] app: pointer tool selector — spawn / paint wall / erase wall / place endpoint (click-drag painting) — + "load maze demo" and "clear geometry" buttons; obstacle view folded into the re-fetch path
+- [x] app: reachability readout in the metrics panel (connected k/n + network cost, with a network-cost sparkline)
+- [x] **Gate check:** verified (native `maze_demo_connects_the_endpoints` reaches `2/2`; in-browser `load_maze_demo` + 10× spans both wells, zero console errors). The colony connects via pre-grown coverage, then the food-starved interior thins and it settles at `1/2` — a *persistent, pruned* shortest-path tube needs an adaptive flux-based model, not tuning (follow-up below)
+- [ ] follow-up (deferred milestone): a *persistent, pruned* shortest-path maze solve — the full "Physarum solves the maze" result. A diffusing long-range chemoattractant was tried and reverted: it yields either a transient connection or, with enough trail persistence to hold, a saturated blanket (~95% of open cells) — not a thin pruned tube. The real result needs an adaptive **flux-based tube model** (Tero-style: edges strengthen with throughput, unused edges decay), not tuning. Deliberate future work.
+
+## M7 — Presets: the lab bench (gate: pick a preset → canonical structure in seconds; presets share as links)
+- [ ] petri-core/petri-wasm: scenario serialization — params + ecology + geometry (walls/endpoints/food) + spawn, round-trippable through the boundary
+- [ ] app: preset menu in Tweakpane + a starter gallery (maze, Tokyo rail, capillary mesh, trunk roads, spiral cells, boom/bust oscillator, competitive exclusion, coexistence)
+- [ ] app: extend the URL codec to carry geometry so a preset round-trips as a shareable link
+- [ ] **Gate check:** each gallery preset loads its canonical structure; a shared link reproduces it
+
+## M8 — Cross-species sensing (gate: territories / a chase neither species makes alone; deterministic)
+- [ ] petri-core: a 2×2 signed sensing-weight matrix — each species senses the other's field with an attract/avoid weight; default 0 keeps current behavior byte-identical
+- [ ] petri-core: determinism re-baselined; predator/prey + territory tests
+- [ ] petri-wasm: cross-sensing setters/getters
+- [ ] app: cross-sensing controls + predator/prey & territory presets
+- [ ] **Gate check:** two species form a stable boundary or chase; same seed reproduces it
+
+## M9 — Structure metrics (gate: a decay sweep shows component count collapse — a measured phase transition)
+- [ ] petri-core: connected components & loops (union-find / Euler characteristic), trail length & branching (skeleton), fractal dimension (box-counting), autocorrelation length — read-only, pre-allocated scratch
+- [ ] petri-core: Lyapunov-style seed-perturbation divergence (perturb seed by 1, measure field divergence per tick)
+- [ ] petri-wasm: structure-metric getters
+- [ ] app: new metric series + overlays (component map, skeleton, long-exposure)
+- [ ] **Gate check:** the component-count series collapses at a `decay` threshold, on screen and in CSV
+
+## M10 — Headless parameter sweep (gate: a reproducible phase-diagram CSV locating a bifurcation)
+- [ ] petri-core: a native batch runner (binary/example) — vary 1–2 knobs × N values × M seeds, no browser, record an order parameter, emit CSV
+- [ ] petri-core: a plotting step (or documented offline recipe) turning the CSV into a phase-diagram figure
+- [ ] petri-core: perf only as needed so a sweep finishes in reasonable wall-clock (the sole place scale is pulled in)
+- [ ] **Gate check:** the sweep CSV + figure locate a regime boundary reproducibly
+
+## M11 — Evolution: heritable traits (gate: a trait distribution drifts over a run; same seed reproduces it)
+- [ ] petri-core: on reproduction, copy parent params with a small mutation instead of the species default; mutation drawn from the sim RNG (determinism preserved)
+- [ ] petri-core: trait-distribution metric; determinism test for the evolutionary trajectory
+- [ ] petri-wasm: trait-distribution getters
+- [ ] app: trait/age coloring + a trait-distribution readout
+- [ ] **Gate check:** under a fixed landscape a trait distribution measurably shifts; reset + same seed reproduces the drift
