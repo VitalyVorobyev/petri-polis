@@ -115,11 +115,11 @@ The next-task queue. Open this first each session, do the top unchecked item, ti
 - [x] **Gate check:** verified in-browser — driving `decay` 0.75→0.985 collapses components 14→4 (then 2), autocorr 5.8→28.8 cells, fractal D 1.40→1.66; component-map overlay colors components to match the count; long-exposure integrates; zero console errors
 - [ ] follow-up (deferred): skeleton-based trail length & branching (node degrees), and a Lyapunov-style seed-perturbation divergence (needs a cloneable twin `Sim`) — both read-only additions in the same vein
 
-## M10 — Headless parameter sweep (gate: a reproducible phase-diagram CSV locating a bifurcation)
-- [ ] petri-core: a native batch runner (binary/example) — vary 1–2 knobs × N values × M seeds, no browser, record an order parameter, emit CSV
-- [ ] petri-core: a plotting step (or documented offline recipe) turning the CSV into a phase-diagram figure
-- [ ] petri-core: perf only as needed so a sweep finishes in reasonable wall-clock (the sole place scale is pulled in)
-- [ ] **Gate check:** the sweep CSV + figure locate a regime boundary reproducibly
+## M10 — Headless parameter sweep ✅ gate met — a reproducible `decay` sweep collapses the component count ~17→~2, located in a CSV + SVG phase diagram
+- [x] petri-core: `src/bin/sweep.rs` — native, dependency-free (std only); varies 1–2 knobs × N values × M seeds headless, reads the M9 `component_count` order parameter (+ trail mass + coexistence), aggregates mean/std across seeds, emits CSV
+- [x] petri-core: hand-rolled SVG figure (no plotting crate) — 1-D line plot with ±std error bars (viridis heatmap in 2-D mode); `--knob`/`--grid`/`--knob2` flags
+- [x] petri-core: `std::thread::scope` parallelism over the independent runs (default 20×6×3000 ticks at 256² in ~21 s, ~11 cores); results scatter back by job index so the output is thread-count-independent and byte-identical per config
+- [x] **Gate check:** the default `decay` sweep collapses components ~17→~2 at the consolidation threshold; CSV + SVG reproducible byte-for-byte; goldens unchanged (32 tests). Figure embedded in the guide
 
 ## M11 — Evolution: heritable traits (gate: a trait distribution drifts over a run; same seed reproduces it)
 - [ ] petri-core: on reproduction, copy parent params with a small mutation instead of the species default; mutation drawn from the sim RNG (determinism preserved)

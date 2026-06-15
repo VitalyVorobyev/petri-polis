@@ -297,6 +297,15 @@ loop Betti number. *Rejected:* folding them into the tick (heavy, and they're wa
 cadence, not tick cadence); a sensitivity (Lyapunov) divergence for now — it needs a cloneable
 twin `Sim` and is tracked as a follow-up.
 
+**D17 — The parameter sweep is a dependency-free native binary, not a notebook or a plotting
+crate.** `crates/petri-core/src/bin/sweep.rs` runs the deterministic core headless across a knob ×
+seeds, reads the existing `component_count` order parameter, and writes a CSV plus a hand-rolled
+SVG phase diagram (a heatmap in 2-D) — no plotting dependency, no rayon (`std::thread::scope`
+parallelizes the independent runs), no backend. Runs scatter their results back by job index, so
+the thread count never changes the output: the same config yields a byte-identical CSV. *Rejected:*
+a plotting crate or a Python/notebook step (a second toolchain for a figure that's a few hundred
+lines of SVG); folding sweeps into the app (they're offline batch work, not interactive).
+
 ## Out of current scope (not deleted)
 
 Scaling via wasm-simd/threads or WebGPU compute (only if scale is craved). See `ROADMAP.md`.
